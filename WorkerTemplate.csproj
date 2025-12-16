@@ -4,7 +4,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <UserSecretsId>dotnet-OBUTxnPst-232ddf42-ad7f-4789-831b-15bb75aa746b</UserSecretsId>
+    <UserSecretsId>dotnet-WorkerTemplate-232ddf42-ad7f-4789-831b-15bb75aa746b</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>
