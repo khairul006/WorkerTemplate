@@ -35,7 +35,6 @@ namespace OBUTxnPst
                         exit_plaza,
                         exit_lane,
                         txn_id,
-                        entry_job,
                         entry_spid,
                         entry_plaza,
                         entry_lane,
@@ -61,7 +60,6 @@ namespace OBUTxnPst
                         @exit_plaza,
                         @exit_lane,
                         @txn_id,
-                        @entry_job,
                         @entry_spid,
                         @entry_plaza,
                         @entry_lane,
@@ -79,6 +77,30 @@ namespace OBUTxnPst
                         @vehicle_class,
                         @obu_detectedtimestamp
                     )
+                    ON CONFLICT (txn_id)
+                    DO UPDATE SET
+                        oper_date = EXCLUDED.oper_date,
+                        txn_date = EXCLUDED.txn_date,
+                        exit_job = EXCLUDED.exit_job,
+                        exit_spid = EXCLUDED.exit_spid,                   
+                        exit_plaza = EXCLUDED.exit_plaza,
+                        exit_lane = EXCLUDED.exit_lane,
+                        entry_spid = EXCLUDED.entry_spid,
+                        entry_plaza = EXCLUDED.entry_plaza,
+                        entry_lane = EXCLUDED.entry_lane,
+                        entry_txn_id = EXCLUDED.entry_txn_id, 
+                        entry_class = EXCLUDED.entry_class,
+                        entry_timestamp = EXCLUDED.entry_timestamp,
+                        transaction_type = EXCLUDED.transaction_type,
+                        txn_date_time = EXCLUDED.txn_date_time,
+                        txn_json = EXCLUDED.txn_json,
+                        media_id = EXCLUDED.media_id,
+                        accountid = EXCLUDED.accountid,
+                        vehicle_plateno = EXCLUDED.vehicle_plateno,
+                        obu_parametertimestamp = EXCLUDED.obu_parametertimestamp,
+                        account_type = EXCLUDED.account_type,
+                        vehicle_class = EXCLUDED.vehicle_class,
+                        obu_detectedtimestamp = EXCLUDED.obu_detectedtimestamp;
                 ";
 
                 // Map payload to parameters
@@ -92,7 +114,6 @@ namespace OBUTxnPst
 
                     ["exit_lane"] = payload.body.exitLaneId,
                     ["txn_id"] = payload.body.transactionId,
-                    ["entry_job"] = payload.body.entrySPId,
                     ["entry_spid"] = payload.body.entrySPId,
                     ["entry_plaza"] = payload.body.entryPlazaId,
 
