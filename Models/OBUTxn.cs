@@ -23,7 +23,7 @@ namespace OBUTxn
     {
         public required string serialNum { get; set; }
         public string? hmac { get; set; }
-        public DateTime timestamp { get; set; }
+        public DateTimeOffset? timestamp { get; set; }
         public string? counter { get; set; }
         public string? version { get; set; }
     }
@@ -37,25 +37,25 @@ namespace OBUTxn
         public string? mediaID { get; set; }
         public string? accId { get; set; }
         public string? accType { get; set; }
-        public DateTime entryTimestamp { get; set; }
+        public DateTimeOffset entryTimestamp { get; set; }
         public string? entrySPId { get; set; }
         public string? entryPlazaId { get; set; }
         public string? entryLaneId { get; set; }
         public string? entryClass { get; set; }
-        public DateTime exitTimestamp { get; set; }
+        public DateTimeOffset exitTimestamp { get; set; }
         public string? exitSPId { get; set; }
         public string? exitPlazaId { get; set; }
         public string? exitLaneId { get; set; }
         public string? exitClass { get; set; }
         public string? registeredVechPlate { get; set; }
-        public DateTime parameterTimestamp { get; set; }
+        public DateTimeOffset parameterTimestamp { get; set; }
     }
 
     public class AdditionalInfo
     {
-        public DateTime operationalDate { get; set; }
+        public DateTimeOffset operationalDate { get; set; }
         public string? operationMode { get; set; }
-        public DateTime bojDateTime { get; set; }
+        public DateTimeOffset bojDateTime { get; set; }
         public string? tcBadgeNo { get; set; }
         public string? jobType { get; set; }
         public int? jobNo { get; set; }
@@ -68,7 +68,7 @@ namespace OBUTxn
         public string? fareFlexiId { get; set; }
         public string? farePlaza { get; set; }
         public string? fareAmount { get; set; }
-        public DateTime detectionTimestamp { get; set; }
-        public DateTime completionTimestamp { get; set; }
+        public DateTimeOffset detectionTimestamp { get; set; }
+        public DateTimeOffset completionTimestamp { get; set; }
     }
 }

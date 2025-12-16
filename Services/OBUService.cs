@@ -1,45 +1,32 @@
-using Microsoft.Extensions.Options;
-using System.Data;
-using System;
-using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
 using Npgsql;
-using OBUTxnPst.Configs;
-using System.Collections.Generic;
-using Newtonsoft.Json.Linq;
+using NpgsqlTypes;
+using OBUTxnPst.Providers;
+using OBUTxnPst.Utils;
 
 namespace OBUTxnPst
 {
     public class OBUService
     {
         private readonly ILogger<OBUService> _logger;
-        private readonly PostgreSQLSettings _postgresSettings;
+        private readonly PostgresService _postgresService;
 
-        public OBUService(IOptions<PostgreSQLSettings> postgresOptions, ILogger<OBUService> logger)
+        public OBUService(
+            PostgresService postgresService,
+            ILogger<OBUService> logger
+        )
         {
-            _postgresSettings = postgresOptions.Value;
+            _postgresService = postgresService;
             _logger = logger;
         }
 
-        private string BuildConnectionString()
-        {
-            // Handle adding Pooling, MaxPoolSize etc. here if needed
-            return _postgresSettings.SslMode
-                ? $"Host={_postgresSettings.Host};Port={_postgresSettings.Port};Username={_postgresSettings.Username};Password={_postgresSettings.Password};Database={_postgresSettings.Database};SSL Mode=Require;"
-                : $"Host={_postgresSettings.Host};Port={_postgresSettings.Port};Username={_postgresSettings.Username};Password={_postgresSettings.Password};Database={_postgresSettings.Database};";
-        }
-
-
-        public bool InsertDataToDB(OBUTxn.Root p, string json)
+        public async Task<bool> ProcessOBUMessageAsync(OBUTxn.Root payload)
         {
             try
             {
-                using var conn = new NpgsqlConnection(BuildConnectionString());
-                conn.Open();
+                string json = Newtonsoft.Json.JsonConvert.SerializeObject(payload);
 
-                using var cmd = conn.CreateCommand();
-                cmd.CommandType = CommandType.Text;
-
-                cmd.CommandText = @"
+                string sql = @"
                     INSERT INTO public.obu_txn(
                         oper_date,
                         txn_date,
@@ -48,11 +35,11 @@ namespace OBUTxnPst
                         exit_plaza,
                         exit_lane,
                         txn_id,
-                        entry_job??,
+                        entry_job,
                         entry_spid,
                         entry_plaza,
                         entry_lane,
-                        entry_txn_id??, 
+                        entry_txn_id, 
                         entry_class,
                         entry_timestamp,
                         transaction_type,
@@ -74,11 +61,11 @@ namespace OBUTxnPst
                         @exit_plaza,
                         @exit_lane,
                         @txn_id,
-                        @entry_job??,
+                        @entry_job,
                         @entry_spid,
                         @entry_plaza,
                         @entry_lane,
-                        @entry_txn_id??, 
+                        @entry_txn_id, 
                         @entry_class,
                         @entry_timestamp,
                         @transaction_type,
@@ -94,42 +81,52 @@ namespace OBUTxnPst
                     )
                 ";
 
-                cmd.Parameters.AddWithValue("oper_date", (object?)p.additionalInfo.operationalDate ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("txn_date", (object?)p.body.exitTimestamp ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("exit_job", (object?)p.additionalInfo.jobNo ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("exit_spid", (object?)p.body.exitSPId ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("exit_plaza", (object?)p.body.exitPlazaId ?? DBNull.Value);
+                // Map payload to parameters
+                var parameters = new Dictionary<string, object?>
+                {
+                    ["oper_date"] = PostgresUtil.Date("oper_date", payload.additionalInfo.operationalDate),
+                    ["txn_date"] = PostgresUtil.Date("txn_date", payload.body.exitTimestamp),
+                    ["exit_job"] = payload.additionalInfo.jobNo,
+                    ["exit_spid"] = payload.body.exitSPId,
+                    ["exit_plaza"] = payload.body.exitPlazaId,
 
-                cmd.Parameters.AddWithValue("exit_lane", (object?)p.body.exitLaneId ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("txn_id", (object?)p.body.transactionId ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("entry_job", (object?)p.body.entrySPId ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("entry_spid", (object?)p.body.entrySPId ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("entry_plaza", (object?)p.body.entryPlazaId ?? DBNull.Value);
+                    ["exit_lane"] = payload.body.exitLaneId,
+                    ["txn_id"] = payload.body.transactionId,
+                    ["entry_job"] = payload.body.entrySPId,
+                    ["entry_spid"] = payload.body.entrySPId,
+                    ["entry_plaza"] = payload.body.entryPlazaId,
 
-                cmd.Parameters.AddWithValue("entry_lane", (object?)p.body.entryLaneId ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("entry_txn_id,", (object?)p.body.transactionId ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("entry_class", (object?)p.body.entryClass ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("entry_timestamp", (object?)p.body.entryTimestamp ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("transaction_type", (object?)p.body.transactionType ?? DBNull.Value);
+                    ["entry_lane"] = payload.body.entryLaneId,
+                    ["entry_txn_id"] = payload.body.transactionId,
+                    ["entry_class"] = payload.body.entryClass,
+                    ["entry_timestamp"] = PostgresUtil.TimestampTz("entry_timestamp", payload.body.entryTimestamp),
+                    ["transaction_type"] = payload.body.transactionType,
 
-                cmd.Parameters.AddWithValue("txn_date_time", (object?)p.body.exitTimestamp ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("media_id", (object?)p.body.mediaID ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("accountid", (object?)p.body.accId ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("vehicle_plateno", (object?)p.body.registeredVechPlate ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("obu_parametertimestamp", (object?)p.body.parameterTimestamp ?? DBNull.Value);
-                
-                cmd.Parameters.AddWithValue("account_type", (object?)p.body.accType ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("vehicle_class", (object?)p.body.exitClass ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("obu_detectedtimestamp", (object?)p.additionalInfo.detectionTimestamp ?? DBNull.Value);
+                    ["txn_date_time"] = PostgresUtil.TimestampTz("txn_date_time", payload.body.exitTimestamp),
+                    ["media_id"] = payload.body.mediaID,
+                    ["accountid"] = payload.body.accId?.Trim(),
+                    ["vehicle_plateno"] = payload.body.registeredVechPlate,
+                    ["obu_parametertimestamp"] = PostgresUtil.TimestampTz("obu_parametertimestamp", payload.body.parameterTimestamp),
 
-                // json
-                string txnJson = Newtonsoft.Json.JsonConvert.SerializeObject(p);
-                cmd.Parameters.AddWithValue("txn_json", txnJson);
+                    ["account_type"] = payload.body.accType,
+                    ["vehicle_class"] = payload.body.exitClass,
+                    ["obu_detectedtimestamp"] = PostgresUtil.TimestampTz("obu_detectedtimestamp", payload.additionalInfo.detectionTimestamp),
+                    ["txn_json"] = PostgresUtil.Jsonb("txn_json", payload)
+                };
 
+                var result = await _postgresService.ExecuteAsync(sql, parameters);
 
-                cmd.ExecuteNonQuery();
-                _logger.LogInformation("Insert successful.");
-                return true;
+                if (result.RowsAffected > 0)
+                {
+                    _logger.LogInformation("OBU transaction inserted successfully.");
+                    return true;
+                }
+                else
+                {
+                    _logger.LogWarning("OBU transaction insert returned 0 rows affected.");
+                    return false;
+                }
+
             }
             catch (Exception ex)
             {

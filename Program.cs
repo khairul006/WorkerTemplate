@@ -38,7 +38,10 @@ namespace OBUTxnPst
                         services.Configure<PostgreSQLSettings>(hostContext.Configuration.GetSection("PostgreSQL"));
 
                         // Add your services as singleton
-                        services.AddSingleton<QueueManager>();
+                        services.AddSingleton<RabbitMQService>();
+                        services.AddSingleton<PostgresService>();
+
+                        // OBUService orchestrates consuming and DB inserts
                         services.AddSingleton<OBUService>();
 
                         // Add the worker
