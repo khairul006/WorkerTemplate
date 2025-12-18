@@ -1,15 +1,9 @@
 ﻿using Microsoft.Extensions.Options;
 using Npgsql;
-using OBUTxnPst.Configs;
-using OBUTxnPst.Models;
-using System;
-using System.Collections.Generic;
-using System.Data;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using WorkerTemplate.Configs;
+using WorkerTemplate.Models;
 
-namespace OBUTxnPst.Providers
+namespace WorkerTemplate.Providers
 {
     public class PostgresService
     {
@@ -17,7 +11,7 @@ namespace OBUTxnPst.Providers
         private readonly PostgreSQLSettings _settings;
 
         public PostgresService(
-            IOptions<PostgreSQLSettings> options, 
+            IOptions<PostgreSQLSettings> options,
             ILogger<PostgresService> logger)
         {
             _settings = options.Value;
@@ -26,11 +20,16 @@ namespace OBUTxnPst.Providers
 
         private string BuildConnectionString()
         {
-            return _settings.SslMode
-                ? $"Host={_settings.Host};Port={_settings.Port};Username={_settings.Username};Password={_settings.Password};Database={_settings.Database};SSL Mode=Require;"
-                : $"Host={_settings.Host};Port={_settings.Port};Username={_settings.Username};Password={_settings.Password};Database={_settings.Database};";
+            return
+                $"Host={_settings.Host};" +
+                $"Port={_settings.Port};" +
+                $"Username={_settings.Username};" +
+                $"Password={_settings.Password};" +
+                $"Database={_settings.Database};" +
+                $"SSL Mode={_settings.SslMode};" +
+                $"Trust Server Certificate={_settings.TrustServerCertificate};";
         }
-        
+
 
         public async Task<PostgresResult> ExecuteAsync(string sql, IReadOnlyDictionary<string, object?>? parameters = null)
         {

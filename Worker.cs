@@ -2,13 +2,13 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
-using OBUTxnPst.Configs;
-using OBUTxnPst.Providers;
+using WorkerTemplate.Configs;
+using WorkerTemplate.Providers;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace OBUTxnPst
+namespace WorkerTemplate
 {
     public class Worker : BackgroundService
     {

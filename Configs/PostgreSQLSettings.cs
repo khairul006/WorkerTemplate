@@ -4,7 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace OBUTxnPst.Configs
+namespace WorkerTemplate.Configs
 {
     public class PostgreSQLSettings
     {
@@ -14,6 +14,7 @@ namespace OBUTxnPst.Configs
         public required string Username { get; set; }
         public required string Password { get; set; }
         public required string Database { get; set; }
-        public required bool SslMode { get; set; }
+        public required string SslMode { get; set; }
+        public required string TrustServerCertificate { get; set; }
     }
 }

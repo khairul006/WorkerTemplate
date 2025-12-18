@@ -1,19 +1,24 @@
-﻿using System;
-using System.Text;
-using OBUTxnPst.Configs;
-using Microsoft.Extensions.Options;
+﻿using Microsoft.Extensions.Options;
+using Newtonsoft.Json;
+using WorkerTemplate.Configs;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using System;
+using System.Text;
+using System.Threading.Channels;
 
-namespace OBUTxnPst.Providers
+namespace WorkerTemplate.Providers
 {
     public class RabbitMQService : IAsyncDisposable
     {
         private readonly ILogger<RabbitMQService> _logger;
         private readonly RabbitMQSettings _settings;
 
-        private IConnection? _connection;
-        private IModel? _channel;
+        private IConnection? _consumerConnection;
+        private IModel? _consumerChannel;
+
+        private IConnection? _publisherConnection;
+        private IModel? _publisherChannel;
 
         public RabbitMQService(
             IOptions<RabbitMQSettings> options,
@@ -24,32 +29,57 @@ namespace OBUTxnPst.Providers
             _settings = options.Value;
         }
 
-        public void Connect()
+        private static ConnectionFactory CreateFactory(
+            string host,
+            int port,
+            string vhost,
+            string username,
+            string password
+        )
+        {
+            return new ConnectionFactory
+            {
+                HostName = host,
+                Port = port,
+                VirtualHost = vhost,
+                UserName = username,
+                Password = password,
+                AutomaticRecoveryEnabled = true,
+                NetworkRecoveryInterval = TimeSpan.FromSeconds(5),
+                RequestedHeartbeat = TimeSpan.FromSeconds(30),
+                DispatchConsumersAsync = true
+            };
+        }
+
+        public void ConnectConsumer()
         {
             try
             {
-                var factory = new ConnectionFactory
-                {
-                    HostName = _settings.ConsumeBrokerHost,
-                    UserName = _settings.ConsumeBrokerUsername,
-                    Password = _settings.ConsumeBrokerPassword,
-                    VirtualHost = _settings.ConsumeVirtualHost,
-                    Port = _settings.ConsumeBrokerPort,
-                    AutomaticRecoveryEnabled = true,
-                    NetworkRecoveryInterval = TimeSpan.FromSeconds(5),
-                    RequestedHeartbeat = TimeSpan.FromSeconds(30),
-                    DispatchConsumersAsync = true // enables async consumers
-                };
+                var c = _settings.Consumer;
+                var factory = CreateFactory(c.Host, c.Port, c.VirtualHost, c.Username, c.Password);
 
-                _connection = factory.CreateConnection();
-                _connection.ConnectionShutdown += (_, e) =>
-                {
-                    _logger.LogWarning("RabbitMQ connection closed: {reason}", e.ReplyText);
-                };
+                _consumerConnection = factory.CreateConnection();
+                _consumerChannel = _consumerConnection.CreateModel();
 
-                _channel = _connection.CreateModel();
+                _consumerChannel.BasicQos(
+                    prefetchSize: 0,
+                    prefetchCount: c.Prefetch,
+                    global: false
+                );
 
-                _logger.LogInformation("RabbitMQ connected successfully.");
+                var args = new Dictionary<string, object>();
+                if (c.QueueType == "quorum")
+                    args["x-queue-type"] = "quorum";
+
+                _consumerChannel.QueueDeclare(
+                    queue: c.Queue,
+                    durable: true,
+                    exclusive: false,
+                    autoDelete: false,
+                    arguments: args
+                );
+
+                _logger.LogInformation("RabbitMQ consumer connected successfully.");
             }
             catch (Exception ex)
             {
@@ -58,73 +88,38 @@ namespace OBUTxnPst.Providers
             }
         }
 
-        public void DeclareQueue()
-        {
-            try
-            {
-                if (_channel == null)
-                    throw new InvalidOperationException("RabbitMQ channel not initialized.");
-
-                var args = new Dictionary<string, object>();
-
-                if (_settings.ConsumeBrokerQueueType?.ToLower() == "quorum")
-                    args.Add("x-queue-type", "quorum");
-
-                _channel.QueueDeclare(
-                    queue: _settings.ConsumeBrokerQueue,
-                    durable: true,
-                    exclusive: false,
-                    autoDelete: false,
-                    arguments: args
-                );
-
-                if (!string.IsNullOrWhiteSpace(_settings.ConsumeBrokerExchange))
-                {
-                    _channel.ExchangeDeclare(_settings.ConsumeBrokerExchange, "direct", durable: true);
-                    _channel.QueueBind(_settings.ConsumeBrokerQueue, _settings.ConsumeBrokerExchange, _settings.ConsumeBrokerRK);
-                }
-
-                _logger.LogInformation("Queue and exchange declared successfully.");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to declare RabbitMQ queue/exchange");
-                throw;
-            }
-        }
 
         public async Task StartConsumingAsync(Func<string, Task<bool>> handler, CancellationToken cancellationToken)
         {
             try
             {
-                if (_channel == null)
-                    throw new InvalidOperationException("RabbitMQ channel not initialized.");
+                if (_consumerChannel == null)
+                    throw new InvalidOperationException("RabbitMQ consumer channel not initialized.");
 
-                _channel.BasicQos(0, _settings.Prefetch, false);
+                var consumer = new AsyncEventingBasicConsumer(_consumerChannel);
 
-                var consumer = new AsyncEventingBasicConsumer(_channel);
                 consumer.Received += async (sender, ea) =>
                 {
                     try
                     {
                         var msg = Encoding.UTF8.GetString(ea.Body.ToArray());
-                        _logger.LogInformation("Consumed json message: {msg}", msg);
+                        //_logger.LogInformation("Consumed json message: {msg}", msg);
 
                         bool success = await handler(msg);
 
                         if (success)
-                            _channel.BasicAck(ea.DeliveryTag, false);
+                            _consumerChannel.BasicAck(ea.DeliveryTag, false);
                         else
-                            _channel.BasicNack(ea.DeliveryTag, false, true);
+                            _consumerChannel.BasicNack(ea.DeliveryTag, false, true);
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Error handling RabbitMQ message");
-                        _channel.BasicNack(ea.DeliveryTag, false, true);
+                        _logger.LogError(ex, "Error handling RabbitMQ consume message");
+                        _consumerChannel.BasicNack(ea.DeliveryTag, false, true);
                     }
                 };
 
-                _channel.BasicConsume(queue: _settings.ConsumeBrokerQueue, autoAck: false, consumer: consumer);
+                _consumerChannel.BasicConsume(queue: _settings.Consumer.Queue, autoAck: false, consumer: consumer);
 
                 _logger.LogInformation("Started consuming from RabbitMQ.");
 
@@ -146,39 +141,84 @@ namespace OBUTxnPst.Providers
             }
         }
 
-        public bool Publish(string exchange, string routingKey, string message)
+        public void ConnectPublisher()
         {
             try
             {
-                if (_channel == null)
-                    throw new InvalidOperationException("RabbitMQ channel not initialized.");
+                var p = _settings.Publisher;
+                var factory = CreateFactory(p.Host, p.Port, p.VirtualHost, p.Username, p.Password);
 
-                var body = Encoding.UTF8.GetBytes(message);
+                _publisherConnection = factory.CreateConnection();
+                _publisherChannel = _publisherConnection.CreateModel();
 
-                // create basic properties
-                var props = _channel.CreateBasicProperties();
-                props.Persistent = true;              // make message survive broker restart
-                props.ContentType = "application/json"; // optional, for clarity
-
-                _channel.BasicPublish(exchange, routingKey, props, body);
-
-                _logger.LogDebug("Message published to {exchange} / {routingKey}", exchange, routingKey);
-                return true;
+                var args = new Dictionary<string, object>();
+                _publisherChannel.ExchangeDeclare(
+                    exchange: p.Exchange,
+                    type: p.ExchangeType,
+                    durable: true,
+                    autoDelete: false,
+                    arguments: args
+                );
+                _logger.LogInformation("RabbitMQ publisher connected successfully.");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to publish to RabbitMQ");
-                return false;
+                _logger.LogError(ex, "Failed to establish RabbitMQ publisher connection");
+                throw; // let hosting retry or fail fast
             }
+        }
+
+
+        public Task<bool> PublishAsync(string message)
+        {
+            if (_publisherChannel == null)
+                throw new InvalidOperationException("RabbitMQ publisher channel not initialized.");
+
+            // Offload the blocking publish to a thread pool thread
+            return Task.Run(() =>
+            {
+                try
+                {
+                    var body = Encoding.UTF8.GetBytes(message);
+
+                    // create basic properties
+                    var props = _publisherChannel.CreateBasicProperties();
+                    props.Persistent = true;              // make message survive broker restart
+                    props.ContentType = "application/json"; // optional, for clarity
+
+                    _publisherChannel.BasicPublish(
+                        exchange: _settings.Publisher.Exchange,
+                        routingKey: _settings.Publisher.RoutingKey,
+                        basicProperties: props,
+                        body: body
+                    );
+
+                    _logger.LogDebug("Message published to {exchange} / {routingKey}", _settings.Publisher.Exchange, _settings.Publisher.RoutingKey);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to publish to RabbitMQ");
+                    return false;
+                }
+            });
         }
 
         public async ValueTask DisposeAsync()
         {
             try
             {
-                _channel?.Dispose();
-                _connection?.Dispose();
+                _consumerChannel?.Close();
+                _consumerConnection?.Close();
+
+                _publisherChannel?.Close();
+                _publisherConnection?.Close();
                 await Task.CompletedTask;
+            }
+            catch (ChannelClosedException)
+            {
+                // Expected during shutdown, ignore
+                _logger.LogDebug("RabbitMQ channel already closed during shutdown.");
             }
             catch (Exception ex)
             {

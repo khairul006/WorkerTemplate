@@ -5,7 +5,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace OBUTxnPst.Models
+namespace WorkerTemplate.Models
 {
     public class PostgresResult
     {

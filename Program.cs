@@ -1,13 +1,13 @@
-using OBUTxnPst;
-using OBUTxnPst.Configs;
-using OBUTxnPst.Providers;
+using WorkerTemplate;
+using WorkerTemplate.Configs;
+using WorkerTemplate.Providers;
 using Serilog;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Serilog.Events;
 
 
-namespace OBUTxnPst
+namespace WorkerTemplate
 {
     public class Program
     {
@@ -27,10 +27,6 @@ namespace OBUTxnPst
                 var builder = Host.CreateDefaultBuilder(args)
                     .UseSerilog() // Important to apply Serilog here
                     .UseConsoleLifetime()
-                    .ConfigureAppConfiguration((hostingContext, config) =>
-                    {
-                        config.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
-                    })
                     .ConfigureServices((hostContext, services) =>
                     {
                         // Bind both RabbitMQ and Postgres settings

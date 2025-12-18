@@ -1,10 +1,10 @@
 using Newtonsoft.Json;
 using Npgsql;
 using NpgsqlTypes;
-using OBUTxnPst.Providers;
-using OBUTxnPst.Utils;
+using WorkerTemplate.Providers;
+using WorkerTemplate.Utils;
 
-namespace OBUTxnPst
+namespace WorkerTemplate
 {
     public class OBUService
     {
