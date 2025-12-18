@@ -1,6 +1,6 @@
 {
     "$schema": "http://json.schemastore.org/template",
-    "author": "Your Name",
+    "author": "zamidi.zakaria@teras.com.my",
     "classifications": [
         "Worker",
         "Template"
@@ -8,6 +8,8 @@
     "identity": "TERAS.WorkerTemplate",
     "name": "Worker Template",
     "shortName": "worker-template",
+    "sourceName": "WorkerTemplate",
+    "preferNameDirectory": true,
     "tags": {
         "language": "C#",
         "type": "project"
@@ -18,16 +20,19 @@
             "target": "./",
             "exclude": [
                 "bin/**",
-                "obj/**"
+                "obj/**",
+                ".vs/**",
+                ".git/**",
+                "**/*.user",
+                "**/*.suo"
             ]
         }
     ],
     "symbols": {
-        "projectName": {
-            "type": "parameter",
-            "datatype": "string",
-            "description": "Project name",
-            "replaces": "WorkerTemplate"
+        "userSecretsGuid": {
+            "type": "generated",
+            "generator": "guid",
+            "replaces": "$guid1$"
         }
     }
 }

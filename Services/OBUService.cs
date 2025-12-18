@@ -20,7 +20,7 @@ namespace WorkerTemplate
             _logger = logger;
         }
 
-        public async Task<bool> ProcessOBUMessageAsync(OBUTxn.Root payload)
+        public async Task<bool> ProcessOBUMessageAsync(OBUTxn payload)
         {
             try
             {

@@ -1,9 +1,9 @@
 ﻿using System;
 using System.Runtime.Intrinsics.Arm;
 
-namespace OBUTxn
+namespace WorkerTemplate.Models
 {
-    public class Root
+    public class OBUTxnMsg
     {
         public required Sdp sdp { get; set; }
         public required Header header { get; set; }
