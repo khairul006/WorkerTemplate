@@ -30,6 +30,33 @@ namespace WorkerTemplate.Providers
                 $"Trust Server Certificate={_settings.TrustServerCertificate};";
         }
 
+        public async Task ConnectPostgresAsync(CancellationToken stoppingToken)
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await using var conn = new NpgsqlConnection(BuildConnectionString());
+                    await conn.OpenAsync(stoppingToken);
+
+                    // Optional lightweight test query
+                    await using var cmd = conn.CreateCommand();
+                    cmd.CommandText = "SELECT 1";
+                    await cmd.ExecuteScalarAsync(stoppingToken);
+
+                    _logger.LogInformation(
+                        "PostgreSQL connected successfully: {Host}:{Port}/{Database}",
+                        _settings.Host, _settings.Port, _settings.Database);
+
+                    break; // connection successful, exit loop
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to establish Postgres connection");
+                    await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken); ; // let hosting retry or fail fast (throw;)
+                }
+            }
+        }
 
         public async Task<PostgresResult> ExecuteAsync(string sql, IReadOnlyDictionary<string, object?>? parameters = null)
         {

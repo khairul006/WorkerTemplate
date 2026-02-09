@@ -1,12 +1,8 @@
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
-using Newtonsoft.Json;
-using WorkerTemplate.Configs;
+using System.Text.Json;
+using WorkerTemplate;
+using WorkerTemplate.Models;
 using WorkerTemplate.Providers;
-using System;
-using System.Threading;
-using System.Threading.Tasks;
+using WorkerTemplate.Services;
 
 namespace WorkerTemplate
 {
@@ -14,26 +10,32 @@ namespace WorkerTemplate
     {
         private readonly ILogger<Worker> _logger;
         private readonly RabbitMQService _rabbitMQService;
-        private readonly OBUService _obuService;
+        private readonly PostgresService _postgresService;
+        private readonly TxnService _txnService;
 
         public Worker(
             ILogger<Worker> logger,
             RabbitMQService rabbitMQService,
-            OBUService obuService
+            PostgresService postgresService,
+            TxnService txnService
         )
         {
             _logger = logger;
             _rabbitMQService = rabbitMQService;
-            _obuService = obuService;
+            _postgresService = postgresService;
+            _txnService = txnService;
         }
 
         public override async Task StartAsync(CancellationToken cancellationToken)
         {
             _logger.LogInformation("Worker service starting at {time}", DateTimeOffset.Now);
 
-            // Connect to RabbitMQ and declare queue/exchange
-            _rabbitMQService.Connect();
-            _rabbitMQService.DeclareQueue();
+            // Connect to RabbitMQ consumer
+            await _rabbitMQService.ConnectConsumer(cancellationToken);
+            // Connect to RabbitMQ publisher
+            await _rabbitMQService.ConnectPublisher(cancellationToken);
+            // Test postgres connection
+            await _postgresService.ConnectPostgresAsync(cancellationToken);
 
             await base.StartAsync(cancellationToken);
         }
@@ -50,14 +52,15 @@ namespace WorkerTemplate
                     try
                     {
                         // Deserialize message
-                        var payload = JsonConvert.DeserializeObject<OBUTxn.Root>(message);
+                        var payload = JsonSerializer.Deserialize<TxnMsg>(message);
+
                         if (payload == null)
                         {
-                            _logger.LogWarning("Failed to deserialize message: {msg}", message);
-                            return false; // will Nack the message
+                            _logger.LogWarning("Failed to deserialize message (null payload): {msg}", message);
+                            return true; // ack and drop
                         }
-                        bool success = await _obuService.ProcessOBUMessageAsync(payload);
 
+                        bool success = await _txnService.PublishTxnAsync(payload);
 
                         if (!success)
                         {

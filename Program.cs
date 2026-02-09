@@ -1,10 +1,10 @@
+using Serilog;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using WorkerTemplate;
 using WorkerTemplate.Configs;
 using WorkerTemplate.Providers;
-using Serilog;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
-using Serilog.Events;
+using WorkerTemplate.Services;
 
 
 namespace WorkerTemplate
@@ -22,7 +22,11 @@ namespace WorkerTemplate
 
             try
             {
-                Log.Information("Starting up the service");
+                var assembly = Assembly.GetEntryAssembly();
+                var serviceName = assembly?.GetName().Name;
+                var version = assembly?.GetName().Version;
+
+                Log.Information("Starting service {ServiceName}, version {Version}", serviceName, version);
 
                 var builder = Host.CreateDefaultBuilder(args)
                     .UseSerilog() // Important to apply Serilog here
@@ -32,13 +36,15 @@ namespace WorkerTemplate
                         // Bind both RabbitMQ and Postgres settings
                         services.Configure<RabbitMQSettings>(hostContext.Configuration.GetSection("RabbitMQ"));
                         services.Configure<PostgreSQLSettings>(hostContext.Configuration.GetSection("PostgreSQL"));
+                        services.Configure<HashSettings>(hostContext.Configuration.GetSection("Hash"));
+                        services.Configure<MerchantSettings>(hostContext.Configuration.GetSection("Merchant"));
 
                         // Add your services as singleton
                         services.AddSingleton<RabbitMQService>();
                         services.AddSingleton<PostgresService>();
 
-                        // OBUService orchestrates consuming and DB inserts
-                        services.AddSingleton<OBUService>();
+                        // TxnService orchestrates consuming and DB inserts
+                        services.AddSingleton<TxnService>();
 
                         // Add the worker
                         services.AddHostedService<Worker>();

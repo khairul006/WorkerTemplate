@@ -1,0 +1,58 @@
+{
+  "RabbitMQ": {
+    "Consumer": {
+      "Host": "127.0.0.1",
+      "Port": 5672,
+      "VirtualHost": "/vhost",
+      "Username": "",
+      "Password": "",
+      "Queue": "TXN.PUB",
+      "QueueType": "classic",
+      "Prefetch": 10
+    },
+    "Publisher": {
+      "Host": "127.0.0.1",
+      "Port": 5672,
+      "VirtualHost": "/vhost",
+      "Username": "",
+      "Password": "",
+      "Exchange": "Trx",
+      "ExchangeType": "fanout",
+      "RoutingKey": ""
+    }
+  },
+  "Hash": {
+    "EnableHash": true,
+    "SecretKey": ""
+  },
+  "Merchant": {
+    "MerchantId": "OBU001"
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft": "Warning"
+    }
+  },
+  "Serilog": {
+    "Using": [ "Serilog.Sinks.Console", "Serilog.Sinks.File" ],
+    "MinimumLevel": "Information",
+    "WriteTo": [
+      {
+        "Name": "Console"
+      },
+      {
+        "Name": "File",
+        "Args": {
+          "path": "Logs/worker-.log",
+          "rollingInterval": "Day",
+          "fileSizeLimitBytes": 314572800,
+          "rollOnFileSizeLimit": true,
+          "retainedFileCountLimit": 30,
+          "outputTemplate": "[{Timestamp:yyyy-MM-dd HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}"
+        }
+      }
+    ],
+    "Enrich": [ "FromLogContext" ]
+  }
+}
