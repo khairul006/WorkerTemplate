@@ -1,6 +1,7 @@
 ﻿using Microsoft.Extensions.Options;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -8,16 +9,22 @@ using WorkerTemplate.Configs;
 
 namespace WorkerTemplate.Providers
 {
+
     public class RabbitMQService : IAsyncDisposable
     {
         private readonly ILogger<RabbitMQService> _logger;
         private readonly RabbitMQSettings _settings;
 
+        // Separate connections for consumer and publisher
         private IConnection? _consumerConnection;
         private IModel? _consumerChannel;
 
         private IConnection? _publisherConnection;
         private IModel? _publisherChannel;
+
+        // Keep track of consumers for automatic rebind
+        private readonly ConcurrentBag<(string queue, Func<string, Task<bool>> handler)> _consumers
+            = new();
 
         public RabbitMQService(
             IOptions<RabbitMQSettings> options,
@@ -114,6 +121,7 @@ namespace WorkerTemplate.Providers
                         global: false
                     );
 
+                    // Declare main queue (quorum / classic)
                     var args = new Dictionary<string, object>();
                     if (c.QueueType == "quorum")
                         args["x-queue-type"] = "quorum";
@@ -147,6 +155,32 @@ namespace WorkerTemplate.Providers
                 if (_consumerChannel == null)
                     throw new InvalidOperationException("RabbitMQ consumer channel not initialized.");
 
+                var queue = _settings.Consumer.Queue;
+                _consumers.Add((queue, handler));
+
+                var channel = _consumerChannel;
+
+                // Step 1: declare retry queue
+                var mainExchange = $"{queue}.exchange";
+                var retryExchange = $"{queue}.retry.exchange";
+                var retryQueue = $"{queue}.retry.5m";
+                var retryTtlMs = 5 * 60 * 1000;
+
+                channel.ExchangeDeclare(mainExchange, ExchangeType.Direct, durable: true);
+                channel.ExchangeDeclare(retryExchange, ExchangeType.Direct, durable: true);
+
+                channel.QueueDeclare(queue, durable: true, exclusive: false, autoDelete: false);
+                channel.QueueBind(queue, mainExchange, queue);
+
+                channel.QueueDeclare(retryQueue, durable: true, exclusive: false, autoDelete: false, arguments: new Dictionary<string, object>
+                {
+                    ["x-message-ttl"] = retryTtlMs,
+                    ["x-dead-letter-exchange"] = mainExchange,
+                    ["x-dead-letter-routing-key"] = queue
+                });
+                channel.QueueBind(retryQueue, retryExchange, "retry");
+
+                // Step 2: set up consumer
                 var consumer = new AsyncEventingBasicConsumer(_consumerChannel);
 
                 consumer.Received += async (sender, ea) =>
@@ -172,13 +206,16 @@ namespace WorkerTemplate.Providers
 
                         if (success)
                             _consumerChannel.BasicAck(ea.DeliveryTag, false);
-                        else
-                            _consumerChannel.BasicNack(ea.DeliveryTag, false, true);
+                        //else
+                        //    _consumerChannel.BasicNack(ea.DeliveryTag, false, true);
+
+                        await HandleRetryAsync(channel, ea, retryExchange);
                     }
                     catch (Exception ex)
                     {
                         _logger.LogError(ex, "Error handling RabbitMQ consume message");
-                        _consumerChannel.BasicNack(ea.DeliveryTag, false, true);
+                        await HandleRetryAsync(channel, ea, retryExchange);
+                        //_consumerChannel.BasicNack(ea.DeliveryTag, false, true);
                     }
                 };
 
@@ -297,6 +334,31 @@ namespace WorkerTemplate.Providers
                 _logger.LogError(ex, "Error during RabbitMQ cleanup");
             }
         }
+
+        private async Task HandleRetryAsync(IModel channel, BasicDeliverEventArgs ea, string retryExchange, int maxRetries = -1)
+        {
+            var headers = ea.BasicProperties.Headers ?? new Dictionary<string, object>();
+            var retryCount = headers.ContainsKey("x-retry") ? Convert.ToInt32(headers["x-retry"]) : 0;
+
+            if (maxRetries != -1 && retryCount >= maxRetries)
+            {
+                _logger.LogWarning("Max retries reached. Dropping message: {msg}", Encoding.UTF8.GetString(ea.Body.ToArray()));
+                channel.BasicAck(ea.DeliveryTag, false);
+                return;
+            }
+
+            channel.BasicAck(ea.DeliveryTag, false);
+
+            var props = channel.CreateBasicProperties();
+            props.Persistent = true;
+            props.Headers ??= new Dictionary<string, object>();
+            props.Headers["x-retry"] = retryCount + 1;
+
+            channel.BasicPublish(retryExchange, "retry", props, ea.Body);
+            _logger.LogInformation("Message sent to retry queue [{retryExchange}] retry #{retryCount}", retryExchange, retryCount + 1);
+            await Task.CompletedTask;
+        }
+
 
     }
 }

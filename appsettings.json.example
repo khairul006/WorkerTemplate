@@ -21,6 +21,15 @@
       "RoutingKey": ""
     }
   },
+  "PostgreSQL": {
+    "Host": "127.0.0.1",
+    "Port": "5432",
+    "Username": "",
+    "Password": "",
+    "Database": "mydb",
+    "SslMode": "Disable",
+    "TrustServerCertificate": true
+  },
   "Hash": {
     "EnableHash": true,
     "SecretKey": ""
