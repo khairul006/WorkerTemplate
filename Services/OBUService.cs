@@ -1,8 +1,12 @@
 using Newtonsoft.Json;
 using Npgsql;
 using NpgsqlTypes;
+using OBUTxnPub.Converters;
+using System.Text.Encodings.Web;
+using System.Text.Json;
 using WorkerTemplate.Providers;
 using WorkerTemplate.Utils;
+using WorkerTemplate.Models;
 
 namespace WorkerTemplate
 {
@@ -20,7 +24,16 @@ namespace WorkerTemplate
             _logger = logger;
         }
 
-        public async Task<bool> ProcessOBUMessageAsync(OBUTxn payload)
+        private static readonly JsonSerializerOptions RmqJsonOptions = new()
+        {
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            Converters =
+            {
+                new CanonicalDateTimeOffsetConverter()
+            }
+        };
+
+        public async Task<bool> ProcessOBUMessageAsync(OBUTxnMsg payload)
         {
             try
             {
