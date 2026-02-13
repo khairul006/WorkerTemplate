@@ -38,10 +38,12 @@ namespace WorkerTemplate
                         services.Configure<PostgreSQLSettings>(hostContext.Configuration.GetSection("PostgreSQL"));
                         services.Configure<HashSettings>(hostContext.Configuration.GetSection("Hash"));
                         services.Configure<MerchantSettings>(hostContext.Configuration.GetSection("Merchant"));
+                        services.Configure<RedisSettings>(hostContext.Configuration.GetSection("Redis"));
 
                         // Add your services as singleton
                         services.AddSingleton<RabbitMQService>();
                         services.AddSingleton<PostgresService>();
+                        services.AddSingleton<RedisService>();
 
                         // TxnService orchestrates consuming and DB inserts
                         services.AddSingleton<TxnService>();
