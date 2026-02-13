@@ -6,8 +6,8 @@
         "Template"
     ],
     "identity": "TERAS.WorkerTemplate",
-    "name": "Worker Template",
-    "shortName": "worker-template",
+    "name": "TERAS Worker Template",
+    "shortName": "WorkerTemplate",
     "sourceName": "WorkerTemplate",
     "preferNameDirectory": true,
     "tags": {
@@ -24,7 +24,8 @@
                 ".vs/**",
                 ".git/**",
                 "**/*.user",
-                "**/*.suo"
+                "**/*.suo",
+                "Logs/**"
             ]
         }
     ],

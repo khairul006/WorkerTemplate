@@ -9,7 +9,6 @@ using WorkerTemplate.Configs;
 
 namespace WorkerTemplate.Providers
 {
-
     public class RabbitMQService : IAsyncDisposable
     {
         private readonly ILogger<RabbitMQService> _logger;
@@ -134,7 +133,7 @@ namespace WorkerTemplate.Providers
                         arguments: args
                     );
 
-                    _logger.LogInformation("RabbitMQ consumer connected (host={Host}, port={Port}, vhost={VirtualHost}, queue={Queue})",
+                    _logger.LogInformation("RabbitMQ consumer connected: (host={Host}, port={Port}, vhost={VirtualHost}, queue={Queue})",
                         c.Host, c.Port, c.VirtualHost, c.Queue);
 
                     break; // success, exit loop
@@ -206,10 +205,8 @@ namespace WorkerTemplate.Providers
 
                         if (success)
                             _consumerChannel.BasicAck(ea.DeliveryTag, false);
-                        //else
-                        //    _consumerChannel.BasicNack(ea.DeliveryTag, false, true);
-
-                        await HandleRetryAsync(channel, ea, retryExchange);
+                        else
+                            await HandleRetryAsync(channel, ea, retryExchange);
                     }
                     catch (Exception ex)
                     {
@@ -263,7 +260,7 @@ namespace WorkerTemplate.Providers
                         arguments: args
                     );
 
-                    _logger.LogInformation("RabbitMQ publisher connected (host={Host}, port={Port}, vhost={VirtualHost}, exchange={Exchange})", p.Host, p.Port, p.VirtualHost, p.Exchange);
+                    _logger.LogInformation("RabbitMQ publisher connected: (host={Host}, port={Port}, vhost={VirtualHost}, exchange={Exchange})", p.Host, p.Port, p.VirtualHost, p.Exchange);
 
                     break; // success, exit loop
                 }
