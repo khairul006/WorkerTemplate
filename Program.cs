@@ -1,10 +1,11 @@
 using Serilog;
 using System.Reflection;
 using System.Runtime.InteropServices;
-using WorkerTemplate;
 using WorkerTemplate.Configs;
 using WorkerTemplate.Providers;
 using WorkerTemplate.Services;
+using WorkerTemplate.Interfaces;
+using WorkerTemplate.Workers;
 
 
 namespace WorkerTemplate
@@ -13,10 +14,25 @@ namespace WorkerTemplate
     {
         public static void Main(string[] args)
         {
+            // Config file path by priority in 1) /app/config/appsettings.json (Azure) 2) /appsettings.json (on-prem)
+            string configPath = File.Exists("/app/config/appsettings.json")
+                ? "/app/config/appsettings.json"
+                : Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+
+            if (File.Exists(configPath))
+            {
+                var fi = new FileInfo(configPath);
+                Console.WriteLine($"[BOOT] Using file: {fi.FullName}, Size={fi.Length} bytes, LastWriteTimeUtc={fi.LastWriteTimeUtc}");
+            }
+            else
+            {
+                Console.WriteLine($"[BOOT-FATAL] configPath resolved to {configPath} but file does not exist!");
+            }
+
             // Setup Serilog to read from appsettings.json BEFORE Host is built
             Log.Logger = new LoggerConfiguration()
                 .ReadFrom.Configuration(new ConfigurationBuilder()
-                    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                    .AddJsonFile(configPath, optional: false, reloadOnChange: true)
                     .Build())
                 .CreateLogger();
 
@@ -27,29 +43,63 @@ namespace WorkerTemplate
                 var version = assembly?.GetName().Version;
 
                 Log.Information("Starting service {ServiceName}, version {Version}", serviceName, version);
+                Log.Information("Using config file: {ConfigPath}", configPath);
 
                 var builder = Host.CreateDefaultBuilder(args)
-                    .UseSerilog() // Important to apply Serilog here
-                    .UseConsoleLifetime()
-                    .ConfigureServices((hostContext, services) =>
-                    {
+                   .ConfigureAppConfiguration((hostContext, config) =>
+                   {
+                       config.Sources.Clear(); // optional: drop the default appsettings.json/env-specific/env-var chain if you want configPath to be authoritative
+                       config.AddJsonFile(configPath, optional: false, reloadOnChange: true);
+                       config.AddEnvironmentVariables(); // keep env var overrides if you use them
+                   })
+                   .UseSerilog()
+                   .UseConsoleLifetime()
+                   .ConfigureServices((hostContext, services) =>
+                   {
                         // Bind both RabbitMQ and Postgres settings
                         services.Configure<RabbitMQSettings>(hostContext.Configuration.GetSection("RabbitMQ"));
                         services.Configure<PostgreSQLSettings>(hostContext.Configuration.GetSection("PostgreSQL"));
-                        services.Configure<HashSettings>(hostContext.Configuration.GetSection("Hash"));
-                        services.Configure<MerchantSettings>(hostContext.Configuration.GetSection("Merchant"));
                         services.Configure<RedisSettings>(hostContext.Configuration.GetSection("Redis"));
+                        services.Configure<ElasticSearchSettings>(hostContext.Configuration.GetSection("ElasticSearch")); -- Commented if not used
+                        services.Configure<ApplicationSettings>(hostContext.Configuration.GetSection("Application"));
 
-                        // Add your services as singleton
-                        services.AddSingleton<RabbitMQService>();
-                        services.AddSingleton<PostgresService>();
-                        services.AddSingleton<RedisService>();
+                        // Add core services (shared)
+                        services.AddSingleton<IRabbitMQService, RabbitMQService>();
+                        services.AddSingleton<IPostgresService, PostgresService>();
+                        services.AddSingleton<IRedisService, RedisService>();
+                        services.AddSingleton<ElasticSearchService>();
 
-                        // TxnService orchestrates consuming and DB inserts
-                        services.AddSingleton<TxnService>();
+                        // Turn into a Transient service so it's isolated per message
+                        services.AddTransient<ITxnService, TxnService>();
+                        services.AddTransient<IPersistorService, PersistorService>();
 
-                        // Add the worker
-                        services.AddHostedService<Worker>();
+                        // Register HttpClient (needed for external API calls)
+                        services.AddHttpClient<ElasticSearchService>();
+                        // Register HttpClient directly mapping the Interface to the Service implementation
+                        var appSettings = hostContext.Configuration.GetSection("Application").Get<ApplicationSettings>();
+                        services.AddHttpClient<ITxnService, TxnService>() // htppClient register with TxnService as Transient instead of singleton
+                            .ConfigurePrimaryHttpMessageHandler(() =>
+                            {
+                                var handler = new HttpClientHandler();
+                                if (appSettings?.IgnoreServerCert == true)
+                                {
+                                    handler.ServerCertificateCustomValidationCallback =
+                                        HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+                                }
+                                return handler;
+                            });
+
+                        // Read queue config directly from hostContext
+                        var queues = hostContext.Configuration.GetSection("RabbitMQ:Default:Queues");
+
+                        var clientEnabled = queues.GetValue<bool>("Client:Enabled");
+                        var persistorEnabled = queues.GetValue<bool>("Persistor:Enabled");
+
+                        if (clientEnabled)
+                            services.AddHostedService<ClientWorker>();s
+
+                        if (persistorEnabled)
+                            services.AddHostedService<PersistorWorker>();
                     });
 
                 if (!System.Diagnostics.Debugger.IsAttached && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))

@@ -9,12 +9,11 @@ namespace WorkerTemplate.Configs
     public class RedisSettings
     {
         public string Host { get; set; } = "localhost";
-        public int Port { get; set; } = 6379;
-        public string? Username { get; set; } // Redis 6+ ACL support
+        public string Port { get; set; } = "6379";
         public string? Password { get; set; }
         public int Database { get; set; } = 0;
-        public bool Ssl { get; set; } = false;
+        public bool UseSsl { get; set; } = false;
         public string? SslHost { get; set; }
-        public string LPPKey { get; set; } = "LPP";
+        public int ConnectTimeoutMs { get; set; } = 5000;
     }
 }

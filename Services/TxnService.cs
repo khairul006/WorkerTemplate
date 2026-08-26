@@ -1,34 +1,67 @@
+using Jose;
 using Microsoft.Extensions.Options;
+using System.Globalization;
+using System.Net.Http;
+using System.Net.Http.Json;
+using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using WorkerTemplate.Configs;
 using WorkerTemplate.Converters;
 using WorkerTemplate.Models;
-using WorkerTemplate.Providers;
 using WorkerTemplate.Utils;
+using WorkerTemplate.Interfaces;
+using WorkerTemplate.Providers;
 
 namespace WorkerTemplate.Services
 {
-    public class TxnService
+    public class TxnService : ITxnService
     {
         private readonly ILogger<TxnService> _logger;
-        private readonly RabbitMQService _rabbitmqService;
-        private readonly PostgresService _postgresService;
-        private readonly HashSettings _hashSettings;
-        private readonly MerchantSettings _merchantSettings;
+        private readonly IPlazaService _plazaService;
+        private readonly IRabbitMQService _rabbitmqService;
+        private readonly IRedisService _redisService;
+        private readonly IPostgresService _postgresService;
+        private readonly SecuritySettings _securitySettings;
+        private readonly ApplicationSettings _applicationSettings;
+        private readonly RabbitMQSettings _queueSettings;
+        private readonly HttpClient _httpClient;
+
+        private static readonly HashSet<string> AllowedTransactionTypes =
+            [
+                "C","TP","B","SU","BR","BU"
+            ];
+
+        private static readonly HashSet<string> OpenSystemTollType = 
+            [ 
+                "B", "BR", "BU"
+            ];
+
+        private static readonly HashSet<string> JKSBExitPlazaIds =
+            [
+                "138", "139"
+            ];
 
         public TxnService(
-            RabbitMQService rabbitmqService,
-            PostgresService postgresService,
-            IOptions<HashSettings> hashOptions,
-            IOptions<MerchantSettings> merchantOptions,
+            IPlazaService plazaService,
+            IRabbitMQService rabbitmqService,
+            IRedisService redisService,
+            IPostgresService postgresService,
+            HttpClient httpClient,
+            IOptions<SecuritySettings> securityOptions,
+            IOptions<ApplicationSettings> applicationOptions,
+            IOptions<RabbitMQSettings> queueOptions,
             ILogger<TxnService> logger
         )
         {
+            _plazaService = plazaService;
             _rabbitmqService = rabbitmqService;
+            _redisService = redisService;
             _postgresService = postgresService;
-            _hashSettings = hashOptions.Value;
-            _merchantSettings = merchantOptions.Value;
+            _httpClient = httpClient;
+            _securitySettings = securityOptions.Value;
+            _applicationSettings = applicationOptions.Value;
+            _queueSettings = queueOptions.Value;
             _logger = logger;
         }
 
@@ -41,203 +74,370 @@ namespace WorkerTemplate.Services
             }
         };
 
-        // Template for publishing transaction message to RabbitMQ
-        public async Task<bool> PublishTxnAsync(TxnMsg payload)
+        // Define retry policies for specific MBB API response codes
+        public static readonly Dictionary<string, RetryPolicy> RetryPolicies = new()
+        {
+            // Retry after 5,10,30 seconds with exponential back-off.Maximum 3 retries.
+            ["MP20002"] = new RetryPolicy
+            {
+                DelaysMs = new[] { 5000, 10000, 30000 }
+            },
+            // Retry once after 30 seconds.
+            ["MP10002"] = new RetryPolicy
+            {
+                DelaysMs = new[] { 30000 }
+            }
+        };
+
+
+        // Processing transaction message from RabbitMQ
+        public async Task<RabbitmqHandlerResult> ProcessLPPMessageAsync(TxnLPPMsg payload, int retryCount)
         {
             try
             {
-                string sql = @"
-                    SELECT token FROM token_table
-                    WHERE id = @id
-                    LIMIT 1;
-                ";
-                var parameters = new Dictionary<string, object?>
+                // Guard clause. Ignore unallowed transaction types early
+                if (!AllowedTransactionTypes.Contains(payload.body.transactionType))
                 {
-                    ["id"] = payload.body.transactionId,
-                };
-                var result = await _postgresService.ExecuteAsync(sql, parameters);
+                    _logger.LogInformation("Non-paying transaction message. TransactionType={transactionType}. TransactionId={transactionId}",
+                        payload.body.transactionType, payload.body.transactionId);
 
-                string? tokenId = null;
-                if (result.Rows.Rows.Count > 0)
-                {
-                    tokenId = result.Rows.Rows[0]["token_id"]?.ToString();
-                }
+                    // Publish to persistor queue to save into database
+                    await PublishTxnResponseAsync(payload, null, null);
 
-                var txnBody = new TxnPubMsg.Body
-                {
-                    transactionId = payload.body.transactionId,
-                    entryTimestamp = payload.body.entryTimestamp,
-                    vehicleClass = payload.body.vehicleClass?.PadLeft(2, '0'),
-                    exitTimestamp = payload.body.exitTimestamp,
-                };
-
-                string signature = string.Empty;
-
-                if (_hashSettings.EnableHash)
-                {
-                    if (string.IsNullOrWhiteSpace(_hashSettings.SecretKey))
-                        throw new InvalidOperationException(
-                            "EnableHash is true but SecretKey is not configured.");
-
-                    // Serialize to compact JSON string
-                    // Default options = no whitespace, no indentation.
-                    string compactJson = JsonSerializer.Serialize(
-                        txnBody,
-                        RmqJsonOptions
-                    );
-
-                    signature = HashUtil.GenerateSignature(compactJson, _hashSettings.SecretKey);
-                }
-
-                var txnPubObj = new TxnPubMsg
-                {
-                    header = new TxnPubMsg.Header
+                    // ack and drop
+                    return new RabbitmqHandlerResult
                     {
-                        timestamp = DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(8)), // current process timestamp in +08:00
-                    },
-                    body = txnBody,
-                    signature = signature
-                };
+                        Action = MessageAction.Ack
+                    };
+                }
 
-                bool success = await _rabbitmqService.PublishAsync(
-                    message: JsonSerializer.Serialize(
-                        txnPubObj,
-                        RmqJsonOptions
-                    )
+                // Build the outbound MBB payload object
+                var txnPayload = await BuildMbbPayloadAsync(payload);
+
+                var serializedPayload = JsonSerializer.Serialize(txnPayload, RmqJsonOptions);
+                _logger.LogInformation("MBB Charge - PAYLOAD - {serializedPayload}", serializedPayload);
+
+                var encryptedPayload = SecurityUtil.SignThenEncrypt(
+                    serializedPayload,
+                    _securitySettings.Mbb.SigningKey,
+                    _securitySettings.Mbb.EncryptionKey
                 );
 
-                return success;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to process transaction: {transactionId}", payload.body.transactionId);
-                return false;
-            }
-        }
-
-        // Template for subscribing transaction response message from RabbitMQ
-        public async Task<bool> SubscribeTxnRspAsync(string rawJson)
-        {
-            if (string.IsNullOrWhiteSpace(rawJson))
-                throw new ArgumentException("Raw JSON cannot be empty", nameof(rawJson));
-
-            var payload = JsonSerializer.Deserialize<TxnRspMsg>(rawJson);
-            if (payload == null)
-            {
-                _logger.LogWarning("Failed to deserialize payload: {rawJson}", rawJson);
-                return false;
-            }
-
-            try
-            {
-                // Extract body as JSON string
-                using JsonDocument doc = JsonDocument.Parse(rawJson);
-                string bodyJson = doc.RootElement.GetProperty("body").GetRawText();
-
-                if (_hashSettings.EnableHash)
+                var mbbRequest = new TxnLPPMBBRequest
                 {
-                    if (string.IsNullOrWhiteSpace(_hashSettings.SecretKey))
-                        throw new InvalidOperationException(
-                            "EnableHash is true but SecretKey is not configured.");
+                    transactionReference = txnPayload.transactionReference,
+                    payload = encryptedPayload
+                };
 
-                    if (string.IsNullOrWhiteSpace(payload.signature))
-                        throw new ArgumentException(
-                            "Signature not provided in the message.",
-                            nameof(payload.signature));
+                // Call POST request to MBB API
+                var response = await SubmitTollCharge(mbbRequest);
 
-                    // get signature from msg
-                    string signature = payload.signature;
-                    //Console.WriteLine("Signature in msg: " + signature);
+                // publish txn/response to Persistor Queue
+                await PublishTxnResponseAsync(payload, txnPayload, response);
 
-                    // Verify signature
-                    bool isValid = HashUtil.VerifySignature(bodyJson, _hashSettings.SecretKey, signature);
-                    //Console.WriteLine("Signature valid? " + isValid);
+                // Handle specific MBB API response code for retry logic
+                if (RetryPolicies.TryGetValue(response.responseCode, out var policy))
+                {
+                    _logger.LogWarning("MBB API POST return error code. TransactionId={transactionId} Code={responseCode} Desc={responseDesc}", payload.body.transactionId, response.responseCode, response.responseDesc);
+                    //Console.WriteLine($"Policy: {JsonSerializer.Serialize(policy)}");
 
-                    if (!isValid)
+                    if (retryCount >= policy.DelaysMs.Length)
                     {
-                        // Log and drop the message if signature verification fails
-                        _logger.LogWarning("Signature verification failed for Response {transactionId}. Message dropped.", payload?.body?.transactionId);
-                        return true;
+                        return new RabbitmqHandlerResult
+                        {
+                            Action = MessageAction.Dead
+                        };
                     }
+
+                    return new RabbitmqHandlerResult
+                    {
+                        Action = MessageAction.Retry,
+                        RetryDelayMs = policy.DelaysMs[retryCount]
+                    };
                 }
 
-                var txnRspSubObj = payload;
-
-                // publish rawJson as what being received
-                bool success = await _rabbitmqService.PublishAsync(
-                    message: rawJson
-                );
-                _logger.LogInformation("Subscribed Response {transactionId} json success: {success}", payload?.body?.transactionId, success);
-
-                return success;
+                // If successful, return true to acknowledge the message
+                _logger.LogInformation("Successfully processed transaction. transactionId={transactionId}", payload.body.transactionId);
+                return new RabbitmqHandlerResult
+                {
+                    Action = MessageAction.Ack
+                };
+                
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to process Response {transactionId}.", payload?.body?.transactionId);
-                return false;
+                _logger.LogError(ex, "Failed to process transaction. Requeue message. transactionId={transactionId}", payload.body.transactionId);
+                return new RabbitmqHandlerResult
+                {
+                    Action = MessageAction.Nack
+                };
             }
         }
 
-        // Template for inserting transaction message into Postgres
-        public async Task<bool> ProcessTxnMessageAsync(TxnMsg payload)
+        /// <summary>
+        /// Handles all fare calculation, apportionment lookup, and metadata assembly.
+        /// </summary>
+        private async Task<TxnLPPMBBPayload> BuildMbbPayloadAsync(TxnLPPMsg payload)
         {
             try
             {
-                string sql = @"
-                    INSERT INTO public.txn(
-                        txn_date,
-                        txn_id,
-                        vehicle_class,
-                        entry_timestamp,
-                        exit_timestamp
-                    ) 
-                    VALUES (
-                        @txn_date,
-                        @txn_id,
-                        @vehicle_class,
-                        @entry_timestamp,
-                        @exit_timestamp
-                    )
-                    ON CONFLICT (txn_id)
-                    DO UPDATE SET
-                        txn_date = EXCLUDED.txn_date,
-                        txn_id = EXCLUDED.txn_id,
-                        vehicle_class = EXCLUDED.vehicle_class,
-                        entry_timestamp = EXCLUDED.entry_timestamp,
-                        exit_timestamp = EXCLUDED.exit_timestamp;
-                ";
-
-                // Map payload to parameters
-                var parameters = new Dictionary<string, object?>
+                // Parse transaction amount once safely
+                if (!decimal.TryParse(payload.body.transactionAmount, NumberStyles.Number, CultureInfo.InvariantCulture, out var parsedAmount))
                 {
-                    ["txn_date"] = PostgresUtil.Date("txn_date", payload.body.exitTimestamp),
-                    ["txn_id"] = payload.body.transactionId,
-                    ["entry_timestamp"] = PostgresUtil.TimestampTz("entry_timestamp", payload.body.entryTimestamp),
-                    ["txn_date_time"] = PostgresUtil.TimestampTz("txn_date_time", payload.body.exitTimestamp),
-                    ["vehicle_class"] = payload.body.vehicleClass,
-                    ["txn_json"] = PostgresUtil.Jsonb("txn_json", payload)
-                };
+                    _logger.LogWarning("Invalid transaction amount format: {Amount}", payload.body.transactionAmount);
+                }
 
-                var result = await _postgresService.ExecuteAsync(sql, parameters);
+                decimal moneyValue;
+                decimal? moneyValue2 = null;
+                decimal? moneyValueTotal = parsedAmount;
+                string supplierLabel;
+                string? partnerLabel = null;
 
-                if (result.RowsAffected > 0)
+                // Handle JKSB vs Non-JKSB Fare Apportionment
+                if (JKSBExitPlazaIds.Contains(payload.body.exitPlazaId))
                 {
-                    _logger.LogInformation("Transaction {transactionId} inserted successfully.", payload.body.transactionId);
-                    return true;
+                    _logger.LogInformation("Calling Fare API. PlazaId={PlazaId} TransactionId={TransactionId}",
+                        payload.body.exitPlazaId, payload.body.transactionId);
+
+                    // Build POST request body for Fare API
+                    var fareRequest = new PostFareRequest
+                    {
+                        serialNum = payload.header.serialNum,
+                        entryPlazaId = payload.body.entryPlazaId ?? payload.additionalInfo.farePlaza,
+                        exitPlazaId = payload.body.exitPlazaId,
+                        exitSPId = payload.body.exitSPId,
+                        exitTimestamp = payload.body.exitTimestamp.ToString("o", CultureInfo.InvariantCulture),
+                        vehicleClass = payload.body.exitClass.PadLeft(2, '0'),
+                        groupId = payload.additionalInfo.fareGroupId,
+                        flexiId = payload.additionalInfo.fareFlexiId
+                    };
+
+                    var fareResponse = await GetFareApportionment(fareRequest);
+                    _logger.LogInformation("Fare API response: {Response}", JsonSerializer.Serialize(fareResponse));
+
+                    // Group apportionment fares in a single lookup pass
+                    var apportionmentLookup = fareResponse.data?.apportionment?.ToLookup(x => x.spid, x => x.fare);
+
+                    moneyValue = apportionmentLookup?["48"].Sum() ?? 0m;
+                    moneyValue2 = apportionmentLookup?["04"].Sum() ?? 0m;
+                    supplierLabel = "JKSB";
+                    partnerLabel = "PLUS";
                 }
                 else
                 {
-                    _logger.LogWarning("Transaction insert {transactionId} returned 0 rows affected.", payload.body.transactionId);
-                    return false;
+                    moneyValue = parsedAmount;
+                    moneyValueTotal = null;
+                    supplierLabel = _applicationSettings.SupplierLabel.Trim().ToUpperInvariant();
                 }
+
+                // Determine product ID and promotion code
+                var productId = OpenSystemTollType.Contains(payload.body.transactionType)
+                    ? "JG_ANPR_OS"
+                    : "JG_ANPR_CS";
+
+                var promotionCodes = (parsedAmount == 0m && !(payload.body.transactionType == "SU" && payload.body.exitPlazaId == payload.body.entryPlazaId))
+                    ? "ZERO_FARE"
+                    : payload.additionalInfo.farePlaza == "997"
+                        ? "JPP"
+                        : null;
+
+                // Cache pre-trimmed variables
+                var customerAccId = payload.body.accId.Trim();
+                var mediumId = payload.body.mediaID.Trim();
+                var exitClassPadded = payload.body.exitClass.PadLeft(2, '0');
+
+                var (moneyAmount, decimalPlaces) = MoneyUtil.ToMinorUnits(payload.body.transactionAmount);
+                var accountType = await GetJustgoAccountType(mediumId, payload.body.exitSPId);
+
+                return new TxnLPPMBBPayload
+                {
+                    merchantAccountId = _applicationSettings.MerchantId,
+                    transactionReference = payload.body.transactionId,
+                    customerReference = customerAccId,
+                    vehicleReference = mediumId,
+                    transactionTimestamp = payload.body.exitTimestamp.ToUniversalTime(),
+                    amount = moneyAmount,
+                    decimalPlaces = decimalPlaces,
+                    currencyCode = "MYR",
+                    metadata = new TxnLPPMBBPayload.Metadata
+                    {
+                        moneyValue = moneyValue,
+                        moneyValue2 = moneyValue2,
+                        moneyValueTotal = moneyValueTotal,
+                        transactionCode = payload.body.transactionId,
+                        transactionTimestamp = payload.body.exitTimestamp,
+                        customerId = customerAccId,
+                        mediumId = mediumId,
+                        salesChannelId = exitClassPadded,
+                        ttype = payload.body.transactionType,
+                        ttypeDescription = TransactionUtil.GetTtypeDescription(payload.body.transactionType),
+                        productId = productId,
+                        promotionCodes = promotionCodes,
+                        entrySpid = payload.body.entrySPId,
+                        entrySpName = TransactionUtil.GetSpName(payload.body.entrySPId),
+                        entryPlaza = payload.body.entryPlazaId,
+                        entryPlazaName = _plazaService.GetPlazaAbbr(payload.body.entryPlazaId),
+                        entryLane = payload.body.entryLaneId,
+                        entryDatetime = payload.body.entryTimestamp,
+                        exitSpid = payload.body.exitSPId,
+                        exitSpName = TransactionUtil.GetSpName(payload.body.exitSPId),
+                        exitPlaza = payload.body.exitPlazaId,
+                        exitPlazaName = _plazaService.GetPlazaAbbr(payload.body.exitPlazaId),
+                        exitLane = payload.body.exitLaneId,
+                        exitDatetime = payload.body.exitTimestamp,
+                        supplierLabel = supplierLabel,
+                        partnerLabel = partnerLabel,
+                        accountType = accountType,
+                        siLabel = "TERAS"
+                    }
+                };
 
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to insert transaction.");
-                return false;
+                _logger.LogError(ex, "Failed to build MBB payload");
+                throw;
             }
         }
 
+
+        private async Task<string?> GetJustgoAccountType(string plateNumber, string exitSpid)
+        {
+            try
+            {
+                // for JPP (exitSpid=02) use RedisKeyLPPJPP, otherwise use RedisKeyLPP
+                var redisKeyLPP = exitSpid == "02" ? _applicationSettings.RedisKeyLPPJPP : _applicationSettings.RedisKeyLPP;
+                var paramValue = await _redisService.HashGetAsync(redisKeyLPP, plateNumber);
+
+                if (paramValue != null)
+                {
+                    var parts = paramValue.Split(';');
+                    var accountType = parts.Length > 9 ? parts[9] : null;
+
+                    _logger.LogInformation(
+                        "GetJustgoAccountType - REDIS - PlateNumber={PlateNumber}, AccountType={AccountType}",
+                        plateNumber, accountType);
+
+                    return accountType;
+                }
+
+                const string sql = """
+                    SELECT account_type
+                    FROM vehicle_parameter
+                    WHERE plate_number = @PlateNumber
+                 """;
+
+                var accountTypeFromDb = (await _postgresService.QueryAsync<string>(
+                    sql,
+                    new { PlateNumber = plateNumber }))
+                    .FirstOrDefault();
+
+                _logger.LogInformation(
+                    "GetJustgoAccountType - POSTGRES - PlateNumber={PlateNumber}, AccountType={AccountType}",
+                    plateNumber, accountTypeFromDb);
+
+                return accountTypeFromDb;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to get account type for plate number {plateNumber}", plateNumber);
+                throw;
+            }
+        }
+
+
+        private async Task PublishTxnResponseAsync(TxnLPPMsg payload, TxnLPPMBBPayload? request, TxnLPPMBBResponse? response)
+        {
+            try
+            {
+                var txnAndResponse = new TxnMBBResponsePst
+                {
+                    txnPayload = payload,
+                    mbbRequest = request,
+                    mbbResponse = response
+                };
+
+                // Serualized with timestamp format include miliseconds
+                var serializedMsg = JsonSerializer.Serialize(txnAndResponse, RmqJsonOptions);
+
+                await _rabbitmqService.PublishAsync(
+                    _queueSettings.Default.Exchanges["Persistor"],
+                    serializedMsg);
+            }
+            catch (Exception ex)
+            {
+                // log it properly
+                _logger.LogError(ex, "Failed to publish txn/response to RabbitMQ. TransactionId: {transactionId}",
+                    payload.body.transactionId);
+                throw;
+            }
+        }
+
+
+        public async Task<HttpResponse<PostFareData>> GetFareApportionment(PostFareRequest requestBody, CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                var json = JsonSerializer.Serialize(requestBody);
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                var endpoint = $"{_applicationSettings.FareServiceApi?.Trim()}/api/fare";
+
+                using var response = await _httpClient.PostAsJsonAsync(endpoint, requestBody, cancellationToken);
+                var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    throw new HttpRequestException($"Fare API error {(int)response.StatusCode}: {responseBody}");
+                }
+
+                var result = JsonSerializer.Deserialize<HttpResponse<PostFareData>>(responseBody);
+                return result ?? throw new InvalidOperationException($"Fare API [{endpoint}] returned null or empty response");
+            }
+            catch (HttpRequestException ex)
+            {
+                // Log and rethrow or handle
+                throw new HttpRequestException($"Get fare apportionment failed: {ex.Message}", ex);
+            }
+        }
+
+
+        public async Task<TxnLPPMBBResponse> SubmitTollCharge(TxnLPPMBBRequest requestBody, CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                var json = JsonSerializer.Serialize(requestBody);
+                _logger.LogInformation("MBB Charge - REQUEST - {requestJson}", json);
+
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+        
+                var endpoint = $"{_applicationSettings.MGateApi?.Trim()}/mpgw/api/v2/{_applicationSettings.MerchantId}/payments/concessionaire/charge";
+
+                var response = await _httpClient.PostAsync(endpoint, content, cancellationToken);
+                var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    throw new HttpRequestException($"MBB Charge API error {(int)response.StatusCode}: {responseBody}");
+                }
+
+                var result = JsonSerializer.Deserialize<TxnLPPMBBResponse>(responseBody);
+                if (result != null)
+                {
+                    _logger.LogInformation("MBB Charge - RESPONSE - {response}", responseBody);
+                    return result;
+                }
+                else
+                {
+                    throw new InvalidOperationException($"MBB Charge API [{endpoint}] returned null or empty response");
+                }
+            }
+            catch (HttpRequestException ex)
+            {
+                // Log and rethrow or handle
+                throw new HttpRequestException($"Submit toll payment charge failed: {ex.Message}", ex);
+            }
+        }
     }
+
 }

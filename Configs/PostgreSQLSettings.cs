@@ -14,7 +14,7 @@ namespace WorkerTemplate.Configs
         public required string Username { get; set; }
         public required string Password { get; set; }
         public required string Database { get; set; }
+        public required string Schema { get; set; } = "public";
         public required string SslMode { get; set; }
-        public required string TrustServerCertificate { get; set; }
     }
 }

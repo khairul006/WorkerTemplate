@@ -1,115 +1,113 @@
-﻿using Microsoft.Extensions.Options;
+﻿using Dapper;
+using Microsoft.Extensions.Options;
 using Npgsql;
+using System.Data;
 using WorkerTemplate.Configs;
-using WorkerTemplate.Models;
+using WorkerTemplate.Interfaces;
 
 namespace WorkerTemplate.Providers
 {
-    public class PostgresService
+    public class PostgresService : IPostgresService
     {
         private readonly ILogger<PostgresService> _logger;
-        private readonly PostgreSQLSettings _settings;
+        private readonly string _connectionString;
 
         public PostgresService(
             IOptions<PostgreSQLSettings> options,
             ILogger<PostgresService> logger)
         {
-            _settings = options.Value;
             _logger = logger;
+            // Build the connection string ONCE during initialization
+            _connectionString = BuildConnectionString(options.Value);
         }
 
-        private string BuildConnectionString()
+        private static string BuildConnectionString(PostgreSQLSettings settings)
         {
-            return
-                $"Host={_settings.Host};" +
-                $"Port={_settings.Port};" +
-                $"Username={_settings.Username};" +
-                $"Password={_settings.Password};" +
-                $"Database={_settings.Database};" +
-                $"SSL Mode={_settings.SslMode};" +
-                $"Trust Server Certificate={_settings.TrustServerCertificate};";
-        }
-
-        public async Task ConnectPostgresAsync(CancellationToken stoppingToken)
-        {
-            while (!stoppingToken.IsCancellationRequested)
+            var builder = new NpgsqlConnectionStringBuilder
             {
-                try
-                {
-                    await using var conn = new NpgsqlConnection(BuildConnectionString());
-                    await conn.OpenAsync(stoppingToken);
+                Host = settings.Host,
+                Port = int.TryParse(settings.Port, out var port) ? port : 5432, // default to 5432 if parsing fails
+                Username = settings.Username,
+                Password = settings.Password,
+                Database = settings.Database,
+                SearchPath = settings.Schema ?? "public", // optional schema setting, default to "public" if not provided
+                SslMode = Enum.TryParse<Npgsql.SslMode>(settings.SslMode, true, out var sslMode) ? sslMode : Npgsql.SslMode.Disable,
 
-                    // Optional lightweight test query
-                    await using var cmd = conn.CreateCommand();
-                    cmd.CommandText = "SELECT 1";
-                    await cmd.ExecuteScalarAsync(stoppingToken);
-
-                    _logger.LogInformation(
-                        "PostgreSQL connected successfully: {Host}:{Port}/{Database}",
-                        _settings.Host, _settings.Port, _settings.Database);
-
-                    break; // connection successful, exit loop
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to establish Postgres connection");
-                    await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken); ; // let hosting retry or fail fast (throw;)
-                }
-            }
+                // Ensure connection pooling is optimized for multi-threaded workers
+                Pooling = true,
+                MinPoolSize = 0,
+                MaxPoolSize = 10
+            };
+            return builder.ConnectionString;
         }
 
-        public async Task<PostgresResult> ExecuteAsync(string sql, IReadOnlyDictionary<string, object?>? parameters = null)
+        // Health check connection
+        public async Task<bool> CheckConnectionAsync(CancellationToken cancellationToken)
         {
-            var result = new PostgresResult();
+            var parser = new NpgsqlConnectionStringBuilder(_connectionString);
+            string safeLogInfo = $"{parser.Host}:{parser.Port}/{parser.Database} (Schema: {parser.SearchPath ?? "public"})";
 
             try
             {
-                await using var conn = new NpgsqlConnection(BuildConnectionString());
-                await conn.OpenAsync();
+                await using var conn = new NpgsqlConnection(_connectionString);
+                await conn.OpenAsync(cancellationToken);
 
                 await using var cmd = conn.CreateCommand();
-                cmd.CommandText = sql;
+                cmd.CommandText = "SELECT 1";
+                await cmd.ExecuteScalarAsync(cancellationToken);
 
-                if (parameters != null)
-                {
-                    foreach (var kv in parameters)
-                        if (kv.Value is NpgsqlParameter npgsqlParam)
-                        {
-                            cmd.Parameters.Add(npgsqlParam);
-                        }
-                        else
-                        {
-                            cmd.Parameters.AddWithValue(kv.Key, kv.Value ?? DBNull.Value);
-                        }
-                }
-
-                // Determine if query returns rows (SELECT or INSERT ... RETURNING)
-                var trimmedSql = sql.TrimStart();
-                bool returnsRows = trimmedSql.StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
-                                || trimmedSql.IndexOf("RETURNING", StringComparison.OrdinalIgnoreCase) >= 0;
-
-
-                if (returnsRows)
-                {
-                    await using var reader = await cmd.ExecuteReaderAsync();
-                    result.Rows.Load(reader);
-                    result.RowsAffected = result.Rows.Rows.Count; // approximate rows affected
-                }
-                else
-                {
-                    // For non-RETURNING DML, get rows affected
-                    // If command is SELECT or INSERT ... RETURNING, ExecuteReader already executed,
-                    // so RowsAffected will be 0, which is fine
-                    result.RowsAffected = await cmd.ExecuteNonQueryAsync();
-                }
-
-                return result;
+                _logger.LogInformation("PostgreSQL health check passed. Connected to: {DatabaseInfo}", safeLogInfo);
+                return true;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Postgres ExecuteAsync failed");
+                _logger.LogError(ex, "Database health check failed.");
+                return false;
+            }
+        }
+
+        // Querying (Data returning)
+        public async Task<IEnumerable<T>> QueryAsync<T>(
+            string sql,
+            object? parameters = null,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                await using var conn = new NpgsqlConnection(_connectionString);
+                await conn.OpenAsync(cancellationToken);
+
+                // Pass the CancellationToken to the Dapper command definition
+                var command = new CommandDefinition(sql, parameters, cancellationToken: cancellationToken);
+                return await conn.QueryAsync<T>(command);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Postgres QueryAsync failed execution.");
                 throw;
             }
         }
+
+        // Executing (Commands)
+        public async Task<int> ExecuteAsync(
+            string sql,
+            object? parameters = null,
+            CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                await using var conn = new NpgsqlConnection(_connectionString);
+                await conn.OpenAsync(cancellationToken);
+
+                var command = new CommandDefinition(sql, parameters, cancellationToken: cancellationToken);
+                return await conn.ExecuteAsync(command);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Postgres ExecuteAsync failed execution.");
+                throw;
+            }
+        }
+
     }
 }

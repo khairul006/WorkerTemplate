@@ -1,361 +1,423 @@
-﻿using Microsoft.Extensions.Options;
+﻿using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using System.Collections.Concurrent;
+using System.Security.Authentication;
 using System.Text;
 using System.Text.Json;
-using System.Threading.Channels;
-using WorkerTemplate.Configs;
+using WorkerTemplate.Configs;s
+using WorkerTemplate.Interfaces;
+using WorkerTemplate.Models;
 
 namespace WorkerTemplate.Providers
 {
-    public class RabbitMQService : IAsyncDisposable
+    public class RabbitMQService : IRabbitMQService
     {
         private readonly ILogger<RabbitMQService> _logger;
         private readonly RabbitMQSettings _settings;
 
-        // Separate connections for consumer and publisher
-        private IConnection? _consumerConnection;
-        private IModel? _consumerChannel;
+        // Mapping a unique connection per target broker cluster/vhost name
+        private readonly ConcurrentDictionary<string, IConnection> _connections = new();
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _connectLocks = new();
 
-        private IConnection? _publisherConnection;
-        private IModel? _publisherChannel;
-
-        // Keep track of consumers for automatic rebind
-        private readonly ConcurrentBag<(string queue, Func<string, Task<bool>> handler)> _consumers
-            = new();
+        // Warm pool of idle channels segregated by broker target for publishing
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<IChannel>> _channelPools = new();
+        // Prevent unbounded channel growth (tune this based on maximum expected parallel workers)
+        private const int MaxPoolSize = 50;
 
         public RabbitMQService(
-            IOptions<RabbitMQSettings> options,
-            ILogger<RabbitMQService> logger
-        )
+        IOptions<RabbitMQSettings> settingsOptions, // Renamed parameter to avoid variable shadowing
+        ILogger<RabbitMQService> logger
+    )
         {
             _logger = logger;
-            _settings = options.Value;
+            _settings = settingsOptions.Value; // Extract the underlying options object
         }
 
-        private static ConnectionFactory CreateFactory(
-            string host,
-            int port,
-            string vhost,
-            string username,
-            string password
-        )
+        private SemaphoreSlim GetConnectLock(string key) =>
+            _connectLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+
+
+        public async Task<IConnection> GetConnectionAsync(
+            BrokerSettings config,
+            string brokerName = "default")
         {
-            var factory = new ConnectionFactory
+            if (_connections.TryGetValue(brokerName, out var existing) && existing.IsOpen)
+                return existing;
+
+            var gate = GetConnectLock(brokerName);
+            await gate.WaitAsync();
+            try
             {
-                // Default settings
-                AutomaticRecoveryEnabled = true,
-                NetworkRecoveryInterval = TimeSpan.FromSeconds(5),
-                RequestedHeartbeat = TimeSpan.FromSeconds(30),
-                DispatchConsumersAsync = true
-            };
+                if (_connections.TryGetValue(brokerName, out existing) && existing.IsOpen)
+                    return existing;
 
-            // URI-based (CloudAMQP, managed RMQ, etc.)
-            if (Uri.TryCreate(host, UriKind.Absolute, out var baseUri) && (baseUri.Scheme == "amqp" || baseUri.Scheme == "amqps"))
-            {
-                // If username/password are NOT in URI, inject them safely
-                if (string.IsNullOrEmpty(baseUri.UserInfo) && !string.IsNullOrEmpty(username) && !string.IsNullOrEmpty(password))
+                var factory = new ConnectionFactory
                 {
-                    var encodedUser = Uri.EscapeDataString(username);
-                    var encodedPass = Uri.EscapeDataString(password);
-                    // vhost MUST keep leading slash, then be encoded
-                    var vhostValue = string.IsNullOrWhiteSpace(vhost) ? "/" : vhost;
-                    if (!vhostValue.StartsWith("/"))
-                        vhostValue = "/" + vhostValue;
+                    HostName = config.Host,
+                    Port = config.Port,
+                    VirtualHost = config.VirtualHost,
+                    UserName = config.Username,
+                    Password = config.Password,
+                    AutomaticRecoveryEnabled = true,
+                    TopologyRecoveryEnabled = true,
+                    NetworkRecoveryInterval = TimeSpan.FromSeconds(5),
+                    RequestedHeartbeat = TimeSpan.FromSeconds(30),
+                    RequestedConnectionTimeout = TimeSpan.FromSeconds(30), // default is often too short across slower networks
+                    SocketReadTimeout = TimeSpan.FromSeconds(30),
+                    SocketWriteTimeout = TimeSpan.FromSeconds(30),
+                };
 
-                    var encodedVhost = Uri.EscapeDataString(vhostValue);
-
-                    var builder = new UriBuilder(baseUri)
-                    {
-                        Port = port,
-                        UserName = encodedUser,
-                        Password = encodedPass,
-                        Path = encodedVhost
-                    };
-                    factory.Uri = builder.Uri;
-                }
-                else
-                {
-                    // Credentials already inside URI (must already be encoded!)
-                    factory.Uri = baseUri;
-                }
-
-                // TLS handling
-                if (baseUri.Scheme == "amqps")
+                if (config.Protocol.Equals("amqps", StringComparison.OrdinalIgnoreCase))
                 {
                     factory.Ssl.Enabled = true;
                     factory.Ssl.AcceptablePolicyErrors =
                         System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors |
                         System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch;
+                    factory.Ssl.ServerName = config.Host;
+
+                    factory.Ssl.Version = SslProtocols.Tls12;
                 }
+
+                var connection = await factory.CreateConnectionAsync($"broker-{brokerName}");
+                _connections[brokerName] = connection;
+                _logger.LogInformation("RabbitMQ connected (name={name}, protocol={Protocol}, host={Host}, port={Port}, vhost={VirtualHost})",
+                    brokerName, config.Protocol, config.Host, config.Port, config.VirtualHost);
+                return connection;
             }
-            else
+            catch (Exception ex)
             {
-                // Fallback to manual configuration for IP-based connections
-                factory.HostName = host;
-                factory.Port = port;
-                factory.VirtualHost = vhost;
-                factory.UserName = username;
-                factory.Password = password;
+                _logger.LogError(ex, "Failed to establish RabbitMQ connection (name={name}, protocol={Protocol}, host={Host}, port={Port}, vhost={VirtualHost})",
+                    brokerName, config.Protocol, config.Host, config.Port, config.VirtualHost);
+                throw;
             }
-
-            return factory;
-        }
-
-        public async Task ConnectConsumer(CancellationToken stoppingToken)
-        {
-            var c = _settings.Consumer;
-
-            while (!stoppingToken.IsCancellationRequested)
+            finally
             {
-                try
-                {
-                    var factory = CreateFactory(c.Host, c.Port, c.VirtualHost, c.Username, c.Password);
-                    _consumerConnection = factory.CreateConnection();
-                    _consumerChannel = _consumerConnection.CreateModel();
-                    _consumerChannel.BasicQos(
-                        prefetchSize: 0,
-                        prefetchCount: c.Prefetch,
-                        global: false
-                    );
-
-                    // Declare main queue (quorum / classic)
-                    var args = new Dictionary<string, object>();
-                    if (c.QueueType == "quorum")
-                        args["x-queue-type"] = "quorum";
-
-                    _consumerChannel.QueueDeclare(
-                        queue: c.Queue,
-                        durable: true,
-                        exclusive: false,
-                        autoDelete: false,
-                        arguments: args
-                    );
-
-                    _logger.LogInformation("RabbitMQ consumer connected: (host={Host}, port={Port}, vhost={VirtualHost}, queue={Queue})",
-                        c.Host, c.Port, c.VirtualHost, c.Queue);
-
-                    break; // success, exit loop
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to establish RabbitMQ connection");
-                    await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken); ; // let hosting retry or fail fast (throw;)
-                }
+                gate.Release();
             }
         }
 
 
-        public async Task StartConsumingAsync(Func<string, Task<bool>> handler, CancellationToken cancellationToken)
+        public async Task StartConsumingAsync(
+            BrokerSettings connConfig,
+            QueueConfig queueConfig,
+            Func<string, int, Task<RabbitmqHandlerResult>> handler,
+            string brokerName = "default",
+            CancellationToken cancellationToken = default)
         {
             try
             {
-                if (_consumerChannel == null)
-                    throw new InvalidOperationException("RabbitMQ consumer channel not initialized.");
+                // Get shared long-lived connection for this broker
+                var connection = await GetConnectionAsync(connConfig, brokerName);
 
-                var queue = _settings.Consumer.Queue;
-                _consumers.Add((queue, handler));
+                // Open a isolated private channel for THIS consumer instance
+                var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
+                await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: (ushort)queueConfig.Prefetch, global: false, cancellationToken: cancellationToken); // check prefetch
 
-                var channel = _consumerChannel;
-
-                // Step 1: declare retry queue
-                var mainExchange = $"{queue}.exchange";
-                var retryExchange = $"{queue}.retry.exchange";
-                var retryQueue = $"{queue}.retry.5m";
-                var retryTtlMs = 5 * 60 * 1000;
-
-                channel.ExchangeDeclare(mainExchange, ExchangeType.Direct, durable: true);
-                channel.ExchangeDeclare(retryExchange, ExchangeType.Direct, durable: true);
-
-                channel.QueueDeclare(queue, durable: true, exclusive: false, autoDelete: false);
-                channel.QueueBind(queue, mainExchange, queue);
-
-                channel.QueueDeclare(retryQueue, durable: true, exclusive: false, autoDelete: false, arguments: new Dictionary<string, object>
-                {
-                    ["x-message-ttl"] = retryTtlMs,
-                    ["x-dead-letter-exchange"] = mainExchange,
-                    ["x-dead-letter-routing-key"] = queue
-                });
-                channel.QueueBind(retryQueue, retryExchange, "retry");
-
-                // Step 2: set up consumer
-                var consumer = new AsyncEventingBasicConsumer(_consumerChannel);
-
-                consumer.Received += async (sender, ea) =>
+                var consumer = new AsyncEventingBasicConsumer(channel);
+                consumer.ReceivedAsync += async (sender, ea) =>
                 {
                     try
                     {
                         var msg = Encoding.UTF8.GetString(ea.Body.ToArray());
                         _logger.LogInformation("Consumed json message: {msg}", msg);
 
-                        // Only check if it’s valid JSON
-                        try
-                        {
-                            using var doc = JsonDocument.Parse(msg);
-                        }
+                        // Perform quick validation syntax checks
+                        try { using var doc = JsonDocument.Parse(msg); }
                         catch (JsonException)
                         {
-                            _logger.LogWarning("Invalid JSON, dropping message: {msg}", msg);
-                            _consumerChannel.BasicAck(ea.DeliveryTag, false);
+                            _logger.LogWarning("Malformed JSON dropped: {msg}", msg);
+                            await channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
                             return;
                         }
 
-                        bool success = await handler(msg);
+                        int retryCount = GetRetryCount(ea);
+                        var result = await handler(msg, retryCount);
 
-                        if (success)
-                            _consumerChannel.BasicAck(ea.DeliveryTag, false);
-                        else
-                            await HandleRetryAsync(channel, ea, retryExchange);
+                        switch (result.Action)
+                        {
+                            case MessageAction.Ack:
+                                await channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+                                return;
+                            case MessageAction.Retry:
+                                if (result.RetryDelayMs == null)
+                                {
+                                    _logger.LogWarning("Retry action requested but no RetryDelayMs provided. Requeue to the main queue.");
+                                    await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
+                                    return;
+                                }
+                                await HandleRetryAsync(channel, queueConfig.QueueName, ea, retryCount, result.RetryDelayMs.Value);
+                                return;
+                            case MessageAction.Nack:
+                                await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
+                                return;
+                            case MessageAction.Dead:
+                                _logger.LogWarning("Failed to process message. Dropping message. Msg={msg}", msg);
+                                await channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+                                return;
+                            default:
+                                _logger.LogError("Unknown handler action: {action}", result.Action);
+                                await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
+                                return;
+                        }
                     }
                     catch (Exception ex)
                     {
                         _logger.LogError(ex, "Error handling RabbitMQ consume message");
-                        await HandleRetryAsync(channel, ea, retryExchange);
-                        //_consumerChannel.BasicNack(ea.DeliveryTag, false, true);
+                        await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
                     }
                 };
 
-                _consumerChannel.BasicConsume(queue: _settings.Consumer.Queue, autoAck: false, consumer: consumer);
-
-                _logger.LogInformation("Started consuming from RabbitMQ.");
-
-                // Keep alive using TaskCompletionSource
-                var tcs = new TaskCompletionSource();
-
-                cancellationToken.Register(() =>
-                {
-                    _logger.LogInformation("RabbitMQ consumption canceled.");
-                    tcs.SetResult();
-                });
-
-                await tcs.Task; // Wait here until cancellation is requested
+                // Start reading. The method completes immediately while the consumer runs continuously in background.
+                await channel.BasicConsumeAsync(queue: queueConfig.QueueName, autoAck: false, consumer: consumer, cancellationToken: cancellationToken);
+                _logger.LogInformation("Started consuming from RabbitMQ. Broker={name}, Queue={q}", brokerName, queueConfig.QueueName);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to start consumer");
+                _logger.LogError(ex, "Failed consuming from RabbitMQ: Broker={name}, Queue={q}", brokerName, queueConfig.QueueName);
                 throw;
             }
         }
 
-        public async Task ConnectPublisher(CancellationToken stoppingToken)
+        public async Task<bool> PublishAsync(
+            ExchangeConfig exchangeConfig,
+            string message,
+            string brokerName = "default",
+            CancellationToken cancellationToken = default)
         {
-            var p = _settings.Publisher;
+            if (!_connections.TryGetValue(brokerName, out var connection) || !connection.IsOpen)
+                throw new InvalidOperationException($"No active connection initialized for broker: {brokerName}");
 
-            while (!stoppingToken.IsCancellationRequested)
+            var pool = _channelPools.GetOrAdd(brokerName, _ => new ConcurrentQueue<IChannel>());
+            IChannel? channel = null;
+
+            // Acquire or Create Channel Safely
+            while (pool.TryDequeue(out var extractedChannel))
             {
-                try
+                if (extractedChannel.IsOpen)
                 {
-                    var factory = CreateFactory(p.Host, p.Port, p.VirtualHost, p.Username, p.Password);
-
-                    _publisherConnection = factory.CreateConnection();
-                    _publisherChannel = _publisherConnection.CreateModel();
-
-                    var args = new Dictionary<string, object>();
-                    _publisherChannel.ExchangeDeclare(
-                        exchange: p.Exchange,
-                        type: p.ExchangeType,
-                        durable: true,
-                        autoDelete: false,
-                        arguments: args
-                    );
-
-                    _logger.LogInformation("RabbitMQ publisher connected: (host={Host}, port={Port}, vhost={VirtualHost}, exchange={Exchange})", p.Host, p.Port, p.VirtualHost, p.Exchange);
-
-                    break; // success, exit loop
+                    channel = extractedChannel;
+                    break;
                 }
-                catch (Exception ex)
+                // Explicitly dispose dead channels to avoid leaks
+                await TryDisposeChannelAsync(extractedChannel);
+            }
+
+            if (channel == null)
+            {
+                var channelOptions = new CreateChannelOptions(
+                    publisherConfirmationsEnabled: true,
+                    publisherConfirmationTrackingEnabled: true
+                );
+                channel = await connection.CreateChannelAsync(channelOptions, cancellationToken);
+            }
+
+            // Setup Short-Lived Timeout for High Throughput
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+
+            try
+            {
+                var body = Encoding.UTF8.GetBytes(message);
+
+                // OPTIMIZATION: v7 prefers direct properties modification via BasicProperties implementation
+                var properties = new BasicProperties
                 {
-                    _logger.LogError(ex, "Failed to establish RabbitMQ publisher connection");
-                    await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken); ; // let hosting retry or fail fast (throw;)
-                }
+                    Persistent = true,
+                    ContentType = "application/json"
+                };
+
+                // Execution blocks asynchronously until ACK/NACK arrives due to publisher confirmations
+                await channel.BasicPublishAsync(
+                    exchange: exchangeConfig.ExchangeName,
+                    routingKey: exchangeConfig.RoutingKey,
+                    mandatory: true,
+                    basicProperties: properties,
+                    body: body,
+                    cancellationToken: linkedCts.Token
+                );
+
+                _logger.LogInformation("Published json message. Broker={broker} Ex={exchange} RK={routingKey} Msg={msg}", brokerName, exchangeConfig.ExchangeName, exchangeConfig.RoutingKey, message);
+
+                // Return to pool only if healthy and pool isn't oversized
+                if (channel.IsOpen && pool.Count < MaxPoolSize)
+                    pool.Enqueue(channel);
+                else
+                    await TryDisposeChannelAsync(channel);
+
+                return true;
+            }
+            catch (RabbitMQ.Client.Exceptions.PublishException pubEx)
+            {
+                // Broker rejected message (e.g., unroutable & mandatory flag set)
+                _logger.LogError(pubEx, "Message rejected or unroutable by broker. Broker={Publisher} Route:{route}", brokerName, exchangeConfig);
+                await TryDisposeChannelAsync(channel);
+                throw;
+            }
+            catch (OperationCanceledException ex)
+            {
+                _logger.LogError(ex, "Publication timed out waiting for ACK. Broker={Publisher} Route:{route}", brokerName, exchangeConfig);
+                await TryDisposeChannelAsync(channel);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to publish message. Broker={Publisher} Route:{route}", brokerName, exchangeConfig);
+                await TryDisposeChannelAsync(channel);
+                throw;
             }
         }
 
-
-        public Task<bool> PublishAsync(string message)
+        private async Task TryDisposeChannelAsync(IChannel? channel)
         {
-            if (_publisherChannel == null)
-                throw new InvalidOperationException("RabbitMQ publisher channel not initialized.");
-
-            // Offload the blocking publish to a thread pool thread
-            return Task.Run(() =>
+            if (channel is null) return;
+            try
             {
-                try
-                {
-                    var body = Encoding.UTF8.GetBytes(message);
-
-                    // create basic properties
-                    var props = _publisherChannel.CreateBasicProperties();
-                    props.Persistent = true;              // make message survive broker restart
-                    props.ContentType = "application/json"; // optional, for clarity
-
-                    _publisherChannel.BasicPublish(
-                        exchange: _settings.Publisher.Exchange,
-                        routingKey: _settings.Publisher.RoutingKey,
-                        basicProperties: props,
-                        body: body
-                    );
-
-                    //_logger.LogDebug("Message published to {exchange} / {routingKey}", _settings.Publisher.Exchange, _settings.Publisher.RoutingKey);
-                    _logger.LogInformation("Published json message: {msg}", message);
-
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to publish to RabbitMQ");
-                    return false;
-                }
-            });
+                await channel.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to smoothly dispose RabbitMQ channel.");
+            }
         }
 
         public async ValueTask DisposeAsync()
         {
+            foreach (var connection in _connections.Values)
+            {
+                try
+                {
+                    await connection.CloseAsync();
+                    await connection.DisposeAsync();
+                }
+                catch (Exception ex) { _logger.LogError(ex, "Failed to cleanly tear down connection."); }
+            }
+
+            foreach (var gate in _connectLocks.Values)
+                gate.Dispose();
+
+            _connections.Clear();
+            _connectLocks.Clear();
+        }
+
+        public async Task EnsureRetryQueuesAsync(
+            string baseQueue,
+            IEnumerable<int> delayIntervalsMs,
+            string brokerName = "default")
+        {
+            if (!_connections.TryGetValue(brokerName, out var connection) || !connection.IsOpen)
+                throw new InvalidOperationException($"No open connection for consumer '{brokerName}'. Call ConnectConsumer first.");
+
+            await using var channel = await connection.CreateChannelAsync();
+
+            foreach (var ms in delayIntervalsMs.Distinct())
+                await CreateRetryQueueAsync(channel, baseQueue, ms);
+        }
+
+        // -----------------------------------------------------------------------------------------------------
+        // @ Private methods
+        // -----------------------------------------------------------------------------------------------------
+
+        private static string ToDelayName(int ms)
+        {
+            var ts = TimeSpan.FromMilliseconds(ms);
+
+            if (ts.TotalHours >= 1)
+                return $"{ts.TotalHours:0.#}h";
+            if (ts.TotalMinutes >= 1)
+                return $"{ts.TotalMinutes:0.#}m";
+            if (ts.TotalSeconds >= 1)
+                return $"{ts.TotalSeconds:0.#}s";
+
+            return $"{ms}ms";
+        }
+
+
+        private async Task CreateRetryQueueAsync(IChannel channel, string baseQueue, int ttlMs)
+        {
             try
             {
-                _consumerChannel?.Close();
-                _consumerConnection?.Close();
+                if (channel == null)
+                    throw new InvalidOperationException("RabbitMQ consumer channel not initialized.");
 
-                _publisherChannel?.Close();
-                _publisherConnection?.Close();
-                await Task.CompletedTask;
-            }
-            catch (ChannelClosedException)
-            {
-                // Expected during shutdown, ignore
-                _logger.LogDebug("RabbitMQ channel already closed during shutdown.");
+                var queueName = $"{baseQueue}.retry.{ToDelayName(ttlMs)}";
+
+                // Dictionary arguments now accept object values directly, method call is async
+                var arguments = new Dictionary<string, object?>
+                {
+                    { "x-message-ttl", ttlMs },
+                    { "x-dead-letter-exchange", "" },
+                    { "x-dead-letter-routing-key", baseQueue }
+                };
+
+                await channel.QueueDeclareAsync(
+                    queue: queueName,
+                    durable: true,
+                    exclusive: false,
+                    autoDelete: false,
+                    arguments: arguments
+                );
+
+                _logger.LogInformation("Retry queue ensured: {queue}", queueName);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error during RabbitMQ cleanup");
+                _logger.LogError(ex, "Failed create retry queues");
             }
         }
 
-        private async Task HandleRetryAsync(IModel channel, BasicDeliverEventArgs ea, string retryExchange, int maxRetries = -1)
+        private async Task HandleRetryAsync(IChannel channel, string baseQueue, BasicDeliverEventArgs ea, int currentRetryCount, int delayMs)
         {
-            var headers = ea.BasicProperties.Headers ?? new Dictionary<string, object>();
-            var retryCount = headers.ContainsKey("x-retry") ? Convert.ToInt32(headers["x-retry"]) : 0;
-
-            if (maxRetries != -1 && retryCount >= maxRetries)
+            try
             {
-                _logger.LogWarning("Max retries reached. Dropping message: {msg}", Encoding.UTF8.GetString(ea.Body.ToArray()));
-                channel.BasicAck(ea.DeliveryTag, false);
-                return;
+                var delayQueue = $"{baseQueue}.retry.{ToDelayName(delayMs)}";
+
+                var headers = ea.BasicProperties?.Headers != null
+                    ? new Dictionary<string, object?>(ea.BasicProperties.Headers)
+                    : new Dictionary<string, object?>();
+
+                headers["retry-count"] = currentRetryCount + 1;
+
+                var properties = new BasicProperties
+                {
+                    Persistent = true,
+                    ContentType = ea.BasicProperties?.ContentType,
+                    CorrelationId = ea.BasicProperties?.CorrelationId,
+                    Headers = headers
+                };
+
+                await channel.BasicPublishAsync(
+                    exchange: "",
+                    routingKey: delayQueue,
+                    mandatory: true,
+                    basicProperties: properties,
+                    body: ea.Body.ToArray()
+                );
+
+                await channel.BasicAckAsync(ea.DeliveryTag, false);
+                _logger.LogInformation("Retrying message. RetryCount={retry}; Queue={queue}", currentRetryCount, delayQueue);
             }
-
-            channel.BasicAck(ea.DeliveryTag, false);
-
-            var props = channel.CreateBasicProperties();
-            props.Persistent = true;
-            props.Headers ??= new Dictionary<string, object>();
-            props.Headers["x-retry"] = retryCount + 1;
-
-            channel.BasicPublish(retryExchange, "retry", props, ea.Body);
-            _logger.LogInformation("Message sent to retry queue [{retryExchange}] retry #{retryCount}", retryExchange, retryCount + 1);
-            await Task.CompletedTask;
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed handle retry message. Queue={queue}", baseQueue);
+                await channel.BasicNackAsync(ea.DeliveryTag, false, true);
+            }
         }
 
+        private int GetRetryCount(BasicDeliverEventArgs ea)
+        {
+            if (ea.BasicProperties?.Headers == null)
+                return 0;
+
+            if (ea.BasicProperties.Headers.TryGetValue("retry-count", out var value) && value != null)
+            {
+                return Convert.ToInt32(value);
+            }
+
+            return 0;
+        }
 
     }
 }

@@ -1,41 +1,45 @@
 {
   "RabbitMQ": {
-    "Consumer": {
-      "Host": "127.0.0.1",
+    "Default": {
+      "Host": "",
       "Port": 5672,
-      "VirtualHost": "/vhost",
+      "VirtualHost": "",
       "Username": "",
       "Password": "",
-      "Queue": "TXN.PUB",
-      "QueueType": "classic",
-      "Prefetch": 10
-    },
-    "Publisher": {
-      "Host": "127.0.0.1",
-      "Port": 5672,
-      "VirtualHost": "/vhost",
-      "Username": "",
-      "Password": "",
-      "Exchange": "Trx",
-      "ExchangeType": "fanout",
-      "RoutingKey": ""
+      "Queues": {
+        "Lookup": {
+          "Enabled": true,
+          "QueueName": "PARAM.LOOKUP",
+          "Prefetch": 10
+        }
+      }
     }
   },
   "PostgreSQL": {
-    "Host": "127.0.0.1",
-    "Port": "5432",
+    "Host": "",
+    "Port": "",
     "Username": "",
     "Password": "",
-    "Database": "mydb",
-    "SslMode": "Disable",
-    "TrustServerCertificate": true
+    "Database": "",
+    "Schema": "",
+    "SslMode": ""
   },
-  "Hash": {
-    "EnableHash": true,
-    "SecretKey": ""
+  "Redis": {
+    "Host": "",
+    "Port": "",
+    "Password": "",
+    "Database": 0,
+    "UseSsl": false,
+    "SslHost": ""
   },
-  "Merchant": {
-    "MerchantId": "OBU001"
+  "ElasticSearch": {
+    "BaseUrl": "",
+    "Username": "",
+    "Password": "",
+    "Index": ""
+  },
+  "Application": {
+    "RedisKeyLookup": "LPPLOOKUP"
   },
   "Logging": {
     "LogLevel": {
@@ -48,7 +52,10 @@
     "MinimumLevel": "Information",
     "WriteTo": [
       {
-        "Name": "Console"
+        "Name": "Console",
+        "Args": {
+          "outputTemplate": "[{Timestamp:yyyy-MM-dd HH:mm:ss}] [{Level:u3}] {Message:lj}{NewLine}{Exception}"
+        }
       },
       {
         "Name": "File",
