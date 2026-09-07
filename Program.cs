@@ -60,7 +60,7 @@ namespace WorkerTemplate
                         services.Configure<RabbitMQSettings>(hostContext.Configuration.GetSection("RabbitMQ"));
                         services.Configure<PostgreSQLSettings>(hostContext.Configuration.GetSection("PostgreSQL"));
                         services.Configure<RedisSettings>(hostContext.Configuration.GetSection("Redis"));
-                        services.Configure<ElasticSearchSettings>(hostContext.Configuration.GetSection("ElasticSearch")); -- Commented if not used
+                        services.Configure<ElasticSearchSettings>(hostContext.Configuration.GetSection("ElasticSearch")); // Commented if not used
                         services.Configure<ApplicationSettings>(hostContext.Configuration.GetSection("Application"));
 
                         // Add core services (shared)
@@ -71,7 +71,7 @@ namespace WorkerTemplate
 
                         // Turn into a Transient service so it's isolated per message
                         services.AddTransient<ITxnService, TxnService>();
-                        services.AddTransient<IPersistorService, PersistorService>();
+                        //services.AddTransient<IPersistorService, PersistorService>();
 
                         // Register HttpClient (needed for external API calls)
                         services.AddHttpClient<ElasticSearchService>();
@@ -96,7 +96,7 @@ namespace WorkerTemplate
                         var persistorEnabled = queues.GetValue<bool>("Persistor:Enabled");
 
                         if (clientEnabled)
-                            services.AddHostedService<ClientWorker>();s
+                            services.AddHostedService<ClientWorker>();
 
                         if (persistorEnabled)
                             services.AddHostedService<PersistorWorker>();

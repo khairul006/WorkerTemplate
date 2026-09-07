@@ -7,7 +7,7 @@ using System.Collections.Concurrent;
 using System.Security.Authentication;
 using System.Text;
 using System.Text.Json;
-using WorkerTemplate.Configs;s
+using WorkerTemplate.Configs;
 using WorkerTemplate.Interfaces;
 using WorkerTemplate.Models;
 
