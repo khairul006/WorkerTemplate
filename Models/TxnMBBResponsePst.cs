@@ -1,13 +1,10 @@
 ﻿using System.Text.Json.Serialization;
 
-namespace WorkerTemplate.Models
+namespace WorkerTemplate.Models;
+
+public class TxnMBBResponsePst
 {
-    public class TxnMBBResponsePst
-    {
-        public required TxnLPPMsg txnPayload { get; set; }
-        public TxnLPPMBBPayload? mbbRequest { get; set; }
-        public TxnLPPMBBResponse? mbbResponse { get; set; }
-    }
-
+    public required TxnLPPMsg txnPayload { get; set; }
+    public TxnLPPMBBPayload? mbbRequest { get; set; }
+    public TxnLPPMBBResponse? mbbResponse { get; set; }
 }
-

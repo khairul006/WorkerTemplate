@@ -1,10 +1,9 @@
 ﻿using System.Data;
 
-namespace WorkerTemplate.Models
+namespace WorkerTemplate.Models;
+
+public class PostgresResult<T>
 {
-    public class PostgresResult<T>
-    {
-        public List<T> Rows { get; set; } = [];
-        public int RowsAffected { get; set; }
-    }
+    public List<T> Rows { get; set; } = [];
+    public int RowsAffected { get; set; }
 }

@@ -5,142 +5,141 @@ using System.Data;
 using WorkerTemplate.Configs;
 using WorkerTemplate.Interfaces;
 
-namespace WorkerTemplate.Providers
+namespace WorkerTemplate.Providers;
+
+public class SqlServerService : ISqlServerService
 {
-    public class SqlServerService : ISqlServerService
+    private readonly ILogger<SqlServerService> _logger;
+    private readonly string _connectionString;
+
+    public SqlServerService(
+        IOptions<SqlServerSettings> options,
+        ILogger<SqlServerService> logger)
     {
-        private readonly ILogger<SqlServerService> _logger;
-        private readonly string _connectionString;
+        _logger = logger;
 
-        public SqlServerService(
-            IOptions<SqlServerSettings> options,
-            ILogger<SqlServerService> logger)
+        // Build the connection string ONCE during initialization
+        _connectionString = BuildConnectionString(options.Value);
+    }
+
+    private static string BuildConnectionString(SqlServerSettings settings)
+    {
+        var builder = new SqlConnectionStringBuilder
         {
-            _logger = logger;
+            DataSource = $"{settings.Host},{settings.Port}",
+            InitialCatalog = settings.Database,
+            UserID = settings.Username,
+            Password = settings.Password,
 
-            // Build the connection string ONCE during initialization
-            _connectionString = BuildConnectionString(options.Value);
+            // Connection pooling
+            Pooling = true,
+            MinPoolSize = 0,
+            MaxPoolSize = 10,
+
+            // Timeout for opening a connection
+            ConnectTimeout = 30,
+
+            // Encrypt connection
+            Encrypt = settings.Encrypt,
+
+            // Useful when using internal/self-signed certificates
+            TrustServerCertificate = settings.TrustServerCertificate
+        };
+
+        return builder.ConnectionString;
+    }
+
+    // Health check connection
+    public async Task<bool> CheckConnectionAsync(
+        CancellationToken cancellationToken)
+    {
+        var parser = new SqlConnectionStringBuilder(_connectionString);
+
+        string safeLogInfo = $"{parser.DataSource}/{parser.InitialCatalog}";
+
+        try
+        {
+            await using var conn = new SqlConnection(_connectionString);
+
+            await conn.OpenAsync(cancellationToken);
+
+            await using var cmd = conn.CreateCommand();
+
+            cmd.CommandText = "SELECT 1";
+
+            await cmd.ExecuteScalarAsync(cancellationToken);
+
+            _logger.LogInformation(
+                "SQL Server health check passed. Connected to: {DatabaseInfo}",
+                safeLogInfo);
+
+            return true;
         }
-
-        private static string BuildConnectionString(SqlServerSettings settings)
+        catch (Exception ex)
         {
-            var builder = new SqlConnectionStringBuilder
-            {
-                DataSource = $"{settings.Host},{settings.Port}",
-                InitialCatalog = settings.Database,
-                UserID = settings.Username,
-                Password = settings.Password,
+            _logger.LogError(
+                ex,
+                "SQL Server database health check failed.");
 
-                // Connection pooling
-                Pooling = true,
-                MinPoolSize = 0,
-                MaxPoolSize = 10,
-
-                // Timeout for opening a connection
-                ConnectTimeout = 30,
-
-                // Encrypt connection
-                Encrypt = settings.Encrypt,
-
-                // Useful when using internal/self-signed certificates
-                TrustServerCertificate = settings.TrustServerCertificate
-            };
-
-            return builder.ConnectionString;
+            return false;
         }
+    }
 
-        // Health check connection
-        public async Task<bool> CheckConnectionAsync(
-            CancellationToken cancellationToken)
+    // Querying (Data returning)
+    public async Task<IEnumerable<T>> QueryAsync<T>(
+        string sql,
+        object? parameters = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
         {
-            var parser = new SqlConnectionStringBuilder(_connectionString);
+            await using var conn = new SqlConnection(_connectionString);
 
-            string safeLogInfo = $"{parser.DataSource}/{parser.InitialCatalog}";
+            await conn.OpenAsync(cancellationToken);
 
-            try
-            {
-                await using var conn = new SqlConnection(_connectionString);
+            var command = new CommandDefinition(
+                sql,
+                parameters,
+                cancellationToken: cancellationToken);
 
-                await conn.OpenAsync(cancellationToken);
-
-                await using var cmd = conn.CreateCommand();
-
-                cmd.CommandText = "SELECT 1";
-
-                await cmd.ExecuteScalarAsync(cancellationToken);
-
-                _logger.LogInformation(
-                    "SQL Server health check passed. Connected to: {DatabaseInfo}",
-                    safeLogInfo);
-
-                return true;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(
-                    ex,
-                    "SQL Server database health check failed.");
-
-                return false;
-            }
+            return await conn.QueryAsync<T>(command);
         }
-
-        // Querying (Data returning)
-        public async Task<IEnumerable<T>> QueryAsync<T>(
-            string sql,
-            object? parameters = null,
-            CancellationToken cancellationToken = default)
+        catch (Exception ex)
         {
-            try
-            {
-                await using var conn = new SqlConnection(_connectionString);
+            _logger.LogError(
+                ex,
+                "SQL Server QueryAsync failed execution.");
 
-                await conn.OpenAsync(cancellationToken);
-
-                var command = new CommandDefinition(
-                    sql,
-                    parameters,
-                    cancellationToken: cancellationToken);
-
-                return await conn.QueryAsync<T>(command);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(
-                    ex,
-                    "SQL Server QueryAsync failed execution.");
-
-                throw;
-            }
+            throw;
         }
+    }
 
-        // Executing (Commands)
-        public async Task<int> ExecuteAsync(
-            string sql,
-            object? parameters = null,
-            CancellationToken cancellationToken = default)
+    // Executing (Commands)
+    public async Task<int> ExecuteAsync(
+        string sql,
+        object? parameters = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
         {
-            try
-            {
-                await using var conn = new SqlConnection(_connectionString);
+            await using var conn = new SqlConnection(_connectionString);
 
-                await conn.OpenAsync(cancellationToken);
+            await conn.OpenAsync(cancellationToken);
 
-                var command = new CommandDefinition(
-                    sql,
-                    parameters,
-                    cancellationToken: cancellationToken);
+            var command = new CommandDefinition(
+                sql,
+                parameters,
+                cancellationToken: cancellationToken);
 
-                return await conn.ExecuteAsync(command);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(
-                    ex,
-                    "SQL Server ExecuteAsync failed execution.");
+            return await conn.ExecuteAsync(command);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "SQL Server ExecuteAsync failed execution.");
 
-                throw;
-            }
+            throw;
         }
     }
 }

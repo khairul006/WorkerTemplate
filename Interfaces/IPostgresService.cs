@@ -5,20 +5,19 @@ using System.Text;
 using System.Threading.Tasks;
 using WorkerTemplate.Models;
 
-namespace WorkerTemplate.Interfaces
+namespace WorkerTemplate.Interfaces;
+
+public interface IPostgresService
 {
-    public interface IPostgresService
-    {
-        Task<bool> CheckConnectionAsync(CancellationToken cancellationToken);
+    Task<bool> CheckConnectionAsync(CancellationToken cancellationToken);
 
-        Task<IEnumerable<T>> QueryAsync<T>(
-            string sql,
-            object? parameters = null,
-            CancellationToken cancellationToken = default);
+    Task<IEnumerable<T>> QueryAsync<T>(
+        string sql,
+        object? parameters = null,
+        CancellationToken cancellationToken = default);
 
-        Task<int> ExecuteAsync(
-            string sql,
-            object? parameters = null,
-            CancellationToken cancellationToken = default);
-    }
+    Task<int> ExecuteAsync(
+        string sql,
+        object? parameters = null,
+        CancellationToken cancellationToken = default);
 }

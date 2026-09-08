@@ -1,7 +1,6 @@
-﻿namespace WorkerTemplate.Configs
+﻿namespace WorkerTemplate.Configs;
+
+public class MerchantSettings
 {
-    public class MerchantSettings
-    {
-        public string? MerchantId { get; set; }
-    }
+    public string? MerchantId { get; set; }
 }

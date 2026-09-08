@@ -5,10 +5,9 @@ using System.Text;
 using System.Threading.Tasks;
 using WorkerTemplate.Models;
 
-namespace WorkerTemplate.Interfaces
+namespace WorkerTemplate.Interfaces;
+
+public interface ITxnService
 {
-    public interface ITxnService
-    {
-        Task<RabbitmqHandlerResult> ProcessLPPMessageAsync(TxnLPPMsg payload, int retryCount);
-    }
+    Task<RabbitmqHandlerResult> ProcessLPPMessageAsync(TxnLPPMsg payload, int retryCount);
 }
