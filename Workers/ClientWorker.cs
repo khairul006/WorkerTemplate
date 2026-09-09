@@ -34,7 +34,7 @@ public class ClientWorker : BackgroundService
 
     public override async Task StartAsync(CancellationToken cancellationToken)
     {
-        _logger.LogInformation("Client Worker service starting at {time}", DateTimeOffset.Now);
+        _logger.LogInformation("Client Worker starting at {time}", DateTimeOffset.Now);
 
         // Connect to RabbitMQ consumer (TERAS)
         await _rabbitMQService.GetConnectionAsync(_queueSettings.Default);
@@ -55,7 +55,7 @@ public class ClientWorker : BackgroundService
         // DECISION: EnsureRetryQueues called before StartConsumingAsync.
         // Queues must exist before any message can be routed to them.
         // If a retry is triggered before the queue exists, RabbitMQ drops the message silently.
-        // TxnService derives the required delays from its own policies � RmqService knows nothing about them.
+        // TxnService derives the required delays from its own policies, RmqService knows nothing about them.
         var requiredDelays = TxnService.RetryPolicies.Values
             .SelectMany(p => p.DelaysMs)
             .Distinct();

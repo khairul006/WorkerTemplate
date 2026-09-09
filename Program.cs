@@ -70,36 +70,40 @@ public class Program
                    services.AddSingleton<ElasticSearchService>();
 
                    // Turn into a Transient service so it's isolated per message
-                   services.AddTransient<ITxnService, TxnService>();
+                   services.AddTransient<IDemoRetryService, DemoRetryService>();
+                   //services.AddTransient<ITxnService, TxnService>();
                    //services.AddTransient<IPersistorService, PersistorService>();
 
                    // Register HttpClient (needed for external API calls)
                    services.AddHttpClient<ElasticSearchService>();
                    // Register HttpClient directly mapping the Interface to the Service implementation
-                   var appSettings = hostContext.Configuration.GetSection("Application").Get<ApplicationSettings>();
-                   services.AddHttpClient<ITxnService, TxnService>() // htppClient register with TxnService as Transient instead of singleton
-                       .ConfigurePrimaryHttpMessageHandler(() =>
-                       {
-                           var handler = new HttpClientHandler();
-                           if (appSettings?.IgnoreServerCert == true)
-                           {
-                               handler.ServerCertificateCustomValidationCallback =
-                                   HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
-                           }
-                           return handler;
-                       });
+                   //var appSettings = hostContext.Configuration.GetSection("Application").Get<ApplicationSettings>();
+                   //services.AddHttpClient<ITxnService, TxnService>() // htppClient register with TxnService as Transient instead of singleton
+                   //    .ConfigurePrimaryHttpMessageHandler(() =>
+                   //    {
+                   //        var handler = new HttpClientHandler();
+                   //        if (appSettings?.IgnoreServerCert == true)
+                   //        {
+                   //            handler.ServerCertificateCustomValidationCallback =
+                   //                HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+                   //        }
+                   //        return handler;
+                   //    });
+
+                   // Add worker
+                   services.AddHostedService<DemoWorker>();
+                   services.AddHostedService<DemoRetryWorker>();
 
                    // Read queue config directly from hostContext
-                   var queues = hostContext.Configuration.GetSection("RabbitMQ:Default:Queues");
+                   //var queues = hostContext.Configuration.GetSection("RabbitMQ:Default:Queues");
+                   //var clientEnabled = queues.GetValue<bool>("Client:Enabled");
+                   //var persistorEnabled = queues.GetValue<bool>("Persistor:Enabled");
 
-                   var clientEnabled = queues.GetValue<bool>("Client:Enabled");
-                   var persistorEnabled = queues.GetValue<bool>("Persistor:Enabled");
+                   //if (clientEnabled)
+                   //    services.AddHostedService<ClientWorker>();
 
-                   if (clientEnabled)
-                       services.AddHostedService<ClientWorker>();
-
-                   if (persistorEnabled)
-                       services.AddHostedService<PersistorWorker>();
+                   //if (persistorEnabled)
+                   //    services.AddHostedService<PersistorWorker>();
                });
 
             if (!System.Diagnostics.Debugger.IsAttached && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))

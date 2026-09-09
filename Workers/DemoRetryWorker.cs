@@ -1,65 +1,68 @@
 using Microsoft.Extensions.Options;
-using System.Runtime;
 using System.Text.Json;
 using WorkerTemplate.Configs;
 using WorkerTemplate.Interfaces;
 using WorkerTemplate.Models;
+using WorkerTemplate.Services;
 
 namespace WorkerTemplate.Workers;
 
-public class PersistorWorker : BackgroundService
+public class DemoRetryWorker : BackgroundService
 {
-    private readonly ILogger<PersistorWorker> _logger;
+    private readonly ILogger<DemoRetryWorker> _logger;
     private readonly IRabbitMQService _rabbitMQService;
-    private readonly IPostgresService _postgresService;
     private readonly RabbitMQSettings _queueSettings;
     private readonly IServiceScopeFactory _scopeFactory;
 
-    public PersistorWorker(
-        ILogger<PersistorWorker> logger,
+    public DemoRetryWorker(
+        ILogger<DemoRetryWorker> logger,
         IRabbitMQService rabbitMQService,
-        IPostgresService postgresService,
         IOptions<RabbitMQSettings> options,
         IServiceScopeFactory scopeFactory
     )
     {
         _logger = logger;
         _rabbitMQService = rabbitMQService;
-        _postgresService = postgresService;
         _queueSettings = options.Value;
         _scopeFactory = scopeFactory;
     }
 
     public override async Task StartAsync(CancellationToken cancellationToken)
     {
-        _logger.LogInformation("Persistor Worker service starting at {time}", DateTimeOffset.Now);
-
-        // Connect to RabbitMQ consumer
+        _logger.LogInformation("DemoRetry Worker starting at {time}", DateTimeOffset.Now);
+        // Connect to RabbitMQ consumer (Default)
         await _rabbitMQService.GetConnectionAsync(_queueSettings.Default);
-        // Test postgres connection
-        await _postgresService.CheckConnectionAsync(cancellationToken);
-
         await base.StartAsync(cancellationToken);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("Persistor Worker running at: {time}", DateTimeOffset.Now);
+        _logger.LogInformation("DemoRetry Worker running at: {time}", DateTimeOffset.Now);
+
+        var queue = _queueSettings.Default.Queues["DemoRetry"];
+
+        // DECISION: EnsureRetryQueues called before StartConsumingAsync.
+        // Queues must exist before any message can be routed to them.
+        // If a retry is triggered before the queue exists, RabbitMQ drops the message silently.
+        // DemoRetryService owns the retry policies, RmqService knows nothing about them.
+        var requiredDelays = DemoRetryService.RetryPolicies.Values
+            .SelectMany(p => p.DelaysMs)
+            .Distinct();
+
+        await _rabbitMQService.EnsureRetryQueuesAsync(queue.QueueName, requiredDelays);
 
         try
         {
-            // Start consuming asynchronously
-            // Define your Queue based on appsettings.json (Persistor)
+            // Define your Queue based on appsettings.json (DemoRetry)
             await _rabbitMQService.StartConsumingAsync(
                 _queueSettings.Default,
-                _queueSettings.Default.Queues["Persistor"],
+                _queueSettings.Default.Queues["DemoRetry"],
                 async (message, retryCount) =>
                 {
-                    LPPJustgoResPayload? payload;
+                    string? payload;
                     try
                     {
-                        // Deserialize message
-                        payload = JsonSerializer.Deserialize<LPPJustgoResPayload>(message);
+                        payload = JsonSerializer.Deserialize<string>(message);
                     }
                     catch (JsonException ex)
                     {
@@ -76,17 +79,16 @@ public class PersistorWorker : BackgroundService
                         _logger.LogWarning("Failed to deserialize message (null payload): {msg}", message);
                         // ack and drop
                         return new RabbitmqHandlerResult
-                        {
-                            Action = MessageAction.Ack
-                        };
+                        { Action = MessageAction.Ack };
                     }
 
+                    // Process the message using a scoped service
                     using var scope = _scopeFactory.CreateScope();
-                    var persistorService = scope.ServiceProvider.GetRequiredService<IPersistorService>();
+                    var demoRetryService = scope.ServiceProvider.GetRequiredService<DemoRetryService>();
 
                     try
                     {
-                        var result = await persistorService.SaveToDbAsync(payload, message, retryCount);
+                        var result = await demoRetryService.ProcessMessageWithRetryAsync(payload, retryCount);
                         return result;
                     }
                     catch (Exception ex)
@@ -97,6 +99,7 @@ public class PersistorWorker : BackgroundService
                 },
                 //"default", // default connection
                 cancellationToken: stoppingToken);
+
             // Keep running until cancelled
             while (!stoppingToken.IsCancellationRequested)
             {
@@ -105,18 +108,18 @@ public class PersistorWorker : BackgroundService
         }
         catch (OperationCanceledException)
         {
-            _logger.LogInformation("Persistor Worker execution canceled.");
+            _logger.LogInformation("DemoRetry Worker execution canceled.");
         }
         finally
         {
-            _logger.LogInformation("Persistor Worker stopping at: {time}", DateTimeOffset.Now);
+            _logger.LogInformation("DemoRetry Worker stopping at: {time}", DateTimeOffset.Now);
         }
     }
 
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        _logger.LogInformation("Persistor Worker service stopping at {time}", DateTimeOffset.Now);
+        _logger.LogInformation("DemoRetry Worker service stopping at {time}", DateTimeOffset.Now);
 
         if (_rabbitMQService != null)
             await _rabbitMQService.DisposeAsync(); // async disposal
