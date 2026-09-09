@@ -84,7 +84,7 @@ public class DemoRetryWorker : BackgroundService
 
                     // Process the message using a scoped service
                     using var scope = _scopeFactory.CreateScope();
-                    var demoRetryService = scope.ServiceProvider.GetRequiredService<DemoRetryService>();
+                    var demoRetryService = scope.ServiceProvider.GetRequiredService<IDemoRetryService>();
 
                     try
                     {
